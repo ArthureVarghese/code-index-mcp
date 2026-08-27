@@ -1,0 +1,5 @@
+from __future__ import annotations
+
+INDEXER_VERSION = "0.1.0"
+PYTHON_ANALYZER_VERSION = "0.1.0"
+MARKDOWN_ANALYZER_VERSION = "0.1.0"
