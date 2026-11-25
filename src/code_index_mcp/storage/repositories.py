@@ -109,6 +109,44 @@ class ProjectRepository:
             metadata=json.loads(row["metadata_json"]),
         )
 
+    def list_all(self) -> list[ProjectMetadata]:
+        rows = self.connection.execute(
+            """
+            SELECT *
+            FROM projects
+            """
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            result.append(
+                ProjectMetadata(
+                    project_id=row["project_id"],
+                    canonical_root=row["canonical_root"],
+                    schema_version=row["schema_version"],
+                    indexer_version=row["indexer_version"],
+                    indexing_state=IndexState(row["indexing_state"]),
+                    configuration_fingerprint=row["configuration_fingerprint"],
+                    last_indexed_at=row["last_indexed_at"],
+                    indexed_files=row["indexed_files"],
+                    indexed_entities=row["indexed_entities"],
+                    indexed_markdown_sections=row["indexed_markdown_sections"],
+                    health=row["health"],
+                    metadata=json.loads(row["metadata_json"]),
+                )
+            )
+        return result
+
+    def get_metadata_json(self, project_id: str) -> dict | None:
+        """Get just the metadata_json for a project (lightweight)."""
+        row = self.connection.execute(
+            "SELECT metadata_json FROM projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["metadata_json"])
+
 
 class EntityRepository:
     def __init__(self, connection: Connection) -> None:
@@ -522,7 +560,7 @@ class RepositoryStore:
         )
 
     def search_symbols(
-        self, query: str, *, kind: str = "all", limit: int = 20
+        self, query: str, *, kind: str = "all", limit: int = 20, path: str | None = None
     ) -> list[dict]:
         q = query.strip().lower()
         where = ""
@@ -531,6 +569,9 @@ class RepositoryStore:
             where = " AND f.source_kind = 'python'"
         elif kind == "markdown":
             where = " AND f.source_kind = 'markdown'"
+        if path:
+            where += " AND f.relative_path = ?"
+            params.append(path)
         rows = self.connection.execute(
             f"""
             SELECT e.entity_id, f.relative_path AS path, e.entity_type AS kind,
@@ -540,7 +581,7 @@ class RepositoryStore:
             ORDER BY CASE WHEN lower(e.name)=? THEN 0 ELSE 1 END, e.name
             LIMIT ?
             """,
-            (f"%{q}%", f"%{q}%", q, *params, limit),
+            (f"%{q}%", f"%{q}%", *params, q, limit),
         ).fetchall()
         return [
             {"entity_id": r["entity_id"], "path": r["path"], "kind": r["kind"],
@@ -550,13 +591,18 @@ class RepositoryStore:
             for r in rows
         ]
 
-    def search_text(self, query: str, *, kind: str = "all", limit: int = 20) -> list[dict]:
+    def search_text(
+        self, query: str, *, kind: str = "all", limit: int = 20, path: str | None = None
+    ) -> list[dict]:
         where = "d.project_id = ?"
         params: list = [self._project_id()]
         if kind == "python":
             where += " AND d.source_kind = 'python'"
         elif kind == "markdown":
             where += " AND d.source_kind = 'markdown'"
+        if path:
+            where += " AND f.path = ?"
+            params.append(f"file:{path}")
         # FTS5 MATCH syntax is deliberately constrained to safe tokens.
         # Strip non-word characters (dots, parens, etc.) that break FTS5 syntax.
         sanitized = re.sub(r"[^\w\s]", " ", query)
@@ -588,7 +634,9 @@ class RepositoryStore:
             })
         return result
 
-    def search_headings(self, query: str, *, limit: int = 20) -> list[dict]:
+    def search_headings(
+        self, query: str, *, limit: int = 20, path: str | None = None
+    ) -> list[dict]:
         """Search markdown sections by heading with hierarchy awareness.
 
         Matches heading text using LIKE, ordered by heading_level ascending
@@ -601,14 +649,19 @@ class RepositoryStore:
             return []
 
         conditions = " AND ".join(["m.heading LIKE ?"] * len(tokens))
-        params: list[str] = [f"%{t}%" for t in tokens]
-        params.extend([project_id, limit])
+        params: list[str] = [project_id] + [f"%{t}%" for t in tokens]
+        join = ""
+        if path:
+            join = " JOIN files f ON f.file_id = m.file_id"
+            conditions += " AND f.relative_path = ?"
+            params.append(path)
+        params.append(limit)
 
         rows = self.connection.execute(
             f"""
             SELECT m.section_id, m.heading, m.heading_level, m.heading_path,
                    m.file_id, m.start_line, m.end_line
-            FROM markdown_sections m
+            FROM markdown_sections m{join}
             WHERE m.project_id = ? AND {conditions}
             ORDER BY m.heading_level ASC
             LIMIT ?

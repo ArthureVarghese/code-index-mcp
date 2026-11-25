@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from code_index_mcp.config import IndexConfig
@@ -80,6 +81,72 @@ class TestToolFunctions:
         tools = {t.name: t for t in server._tool_manager._tools.values()}
         tools["search_docs"].fn("/tmp/proj", "query")
         pm.search.assert_called_once()
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_project_keywords_tool(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_project"].fn("/tmp/proj", "auth token", keywords=True)
+        pm.search_batch.assert_called_once()
+        args = pm.search_batch.call_args
+        assert args[0][1] == ["auth", "token"]
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_code_keywords_tool(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_code"].fn("/tmp/proj", "seed rating", keywords=True)
+        pm.search_batch.assert_called_once()
+        args = pm.search_batch.call_args
+        assert args[0][1] == ["seed", "rating"]
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_docs_keywords_tool(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_docs"].fn("/tmp/proj", "install cache", keywords=True)
+        pm.search_batch.assert_called_once()
+        args = pm.search_batch.call_args
+        assert args[0][1] == ["install", "cache"]
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_project_no_keywords_uses_search(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_project"].fn("/tmp/proj", "query")
+        pm.search.assert_called_once()
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_project_path_uses_search(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_project"].fn("/tmp/proj", "query", path="src/a.py")
+        pm.search.assert_called_once_with(
+            Path("/tmp/proj"), "query", kind="all", limit=20, path="src/a.py"
+        )
+
+    @patch("code_index_mcp.server.ProjectManager")
+    def test_search_code_path_and_keywords(self, MockPM):
+        pm = self._make_manager_mock()
+        MockPM.return_value = pm
+        server = create_server()
+        tools = {t.name: t for t in server._tool_manager._tools.values()}
+        tools["search_code"].fn(
+            "/tmp/proj", "seed rating", keywords=True, path="src/a.py"
+        )
+        pm.search_batch.assert_called_once_with(
+            Path("/tmp/proj"), ["seed", "rating"], kind="python", limit=20, path="src/a.py"
+        )
 
     @patch("code_index_mcp.server.ProjectManager")
     def test_get_symbol_tool(self, MockPM):

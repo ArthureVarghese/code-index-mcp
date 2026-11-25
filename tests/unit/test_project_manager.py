@@ -87,6 +87,46 @@ class TestProjectManager:
         result = manager.search(tmp_path, "foo")
         assert "results" in result
 
+    def test_search_batch(self, manager, tmp_path):
+        (tmp_path / "test.py").write_text(
+            "def foo():\n    pass\n"
+            "def bar():\n    pass\n"
+        )
+        manager.index_project(tmp_path)
+        result = manager.search_batch(tmp_path, ["foo", "bar"])
+        assert "keywords" in result
+        assert "results" in result
+        assert result["keywords"] == ["foo", "bar"]
+
+    def test_search_scoped_to_path(self, manager, tmp_path):
+        (tmp_path / "a.py").write_text("def token_a():\n    pass\n")
+        (tmp_path / "b.py").write_text("def token_b():\n    pass\n")
+        manager.index_project(tmp_path)
+        result = manager.search(tmp_path, "token", path="a.py")
+        for r in result["results"]:
+            assert r["path"] == "a.py"
+
+    def test_search_batch_scoped_to_path(self, manager, tmp_path):
+        (tmp_path / "a.py").write_text("def foo():\n    pass\n")
+        (tmp_path / "b.py").write_text("def foo():\n    pass\n")
+        manager.index_project(tmp_path)
+        result = manager.search_batch(tmp_path, ["foo"], path="a.py")
+        for r in result["results"]:
+            assert r["path"] == "a.py"
+
+    def test_search_docs_scoped_to_markdown_path(self, manager, tmp_path):
+        (tmp_path / "one.md").write_text(
+            "# Project\n\n## Configuration\n\nEdit config.yaml.\n"
+        )
+        (tmp_path / "two.md").write_text(
+            "# Other\n\n## Configuration\n\nEdit config.toml.\n"
+        )
+        manager.index_project(tmp_path)
+        result = manager.search(tmp_path, "Configuration", kind="markdown", path="one.md")
+        assert result["results"], "expected heading match in one.md"
+        for r in result["results"]:
+            assert r["path"] == "one.md"
+
     def test_get_file_outline(self, manager, tmp_path):
         (tmp_path / "test.py").write_text("x = 1\n")
         manager.index_project(tmp_path)

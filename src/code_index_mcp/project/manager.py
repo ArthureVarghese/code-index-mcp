@@ -12,14 +12,18 @@ from code_index_mcp.indexing.markdown.analyzer import MarkdownAnalyzer
 from code_index_mcp.indexing.python.analyzer import PythonAnalyzer
 from code_index_mcp.models.projects import IndexState
 from code_index_mcp.project.identity import canonical_project_root, project_id_for_root
-from code_index_mcp.project.metadata import ensure_project_metadata, set_project_state
+from code_index_mcp.project.metadata import (
+    ensure_central_db,
+    ensure_project_metadata,
+    set_project_state,
+)
 from code_index_mcp.retrieval.context import project_entity
 from code_index_mcp.retrieval.engine import RetrievalEngine
 from code_index_mcp.search.engine import SearchEngine
 from code_index_mcp.security.ignore import IgnoreMatcher
 from code_index_mcp.security.paths import PathSecurityError, ProjectPathGuard
 from code_index_mcp.storage.database import Database
-from code_index_mcp.storage.repositories import RepositoryStore
+from code_index_mcp.storage.repositories import ProjectRepository, RepositoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,134 @@ class ProjectManager:
         self._summary_provider = None
         self._watchers: dict[str, Any] = {}
         self._watchers_lock = threading.Lock()
+        self._restore_watchers()
+
+    def _restore_watchers(self) -> None:
+        """Load watcher configs from central projects registry and start them."""
+        try:
+            central_db = ensure_central_db(self.config)
+            repo = ProjectRepository(central_db._connection)
+            projects = repo.list_all()
+            for project in projects:
+                watcher_config = project.metadata.get("watchers")
+                if watcher_config and watcher_config.get("enabled"):
+                    root = Path(watcher_config.get("canonical_root", project.canonical_root))
+                    interval = watcher_config.get("interval", 0.5)
+                    try:
+                        self._start_watcher_internal(root, interval)
+                        logger.info(
+                            "Restored watcher for project: %s (interval=%.1f)",
+                            root, interval
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to restore watcher for %s: %s", root, e
+                        )
+            central_db.close()
+        except Exception as e:
+            logger.warning("Failed to restore watchers from central registry: %s", e)
+
+    def _start_watcher_internal(self, root: Path, interval: float) -> None:
+        """Start a watcher without persisting config (for internal/restore use)."""
+        from ..watcher.debounce import Debouncer
+        from ..watcher.service import FileWatcher
+
+        key = str(root)
+        debouncer = Debouncer(
+            delay=0.5,
+            callback=lambda _path: self.refresh_index(root),
+        )
+        watcher = FileWatcher(
+            root,
+            callback=lambda p: debouncer.submit(str(p)),
+            interval_seconds=interval,
+        )
+        watcher.start()
+
+        with self._watchers_lock:
+            self._watchers[key] = {"watcher": watcher, "debouncer": debouncer}
+
+    def _save_watcher_config(self, project_root: Path, interval: float) -> None:
+        """Persist watcher config to project metadata and central registry."""
+        project_id = self.project_id(project_root)
+        # Update project DB
+        db = Database(self.database_path(project_root))
+        repo = ProjectRepository(db._connection)
+        project = repo.get(project_id)
+        if project is None:
+            db.close()
+            return
+        metadata = dict(project.metadata)
+        metadata["watchers"] = {
+            "enabled": True,
+            "interval": interval,
+            "canonical_root": str(project_root),
+        }
+        updated = project.__class__(
+            project_id=project.project_id,
+            canonical_root=project.canonical_root,
+            schema_version=project.schema_version,
+            indexer_version=project.indexer_version,
+            indexing_state=project.indexing_state,
+            configuration_fingerprint=project.configuration_fingerprint,
+            last_indexed_at=project.last_indexed_at,
+            indexed_files=project.indexed_files,
+            indexed_entities=project.indexed_entities,
+            indexed_markdown_sections=project.indexed_markdown_sections,
+            health=project.health,
+            metadata=metadata,
+        )
+        with db.transaction():
+            repo.upsert(updated)
+        db.close()
+        # Also update central registry
+        try:
+            central_db = ensure_central_db(self.config)
+            central_repo = ProjectRepository(central_db._connection)
+            with central_db.transaction():
+                central_repo.upsert(updated)
+            central_db.close()
+        except Exception as e:
+            logger.warning("Failed to update watcher config in central registry: %s", e)
+
+    def _remove_watcher_config(self, project_root: Path) -> None:
+        """Remove watcher config from project metadata and central registry."""
+        project_id = self.project_id(project_root)
+        # Update project DB
+        db = Database(self.database_path(project_root))
+        repo = ProjectRepository(db._connection)
+        project = repo.get(project_id)
+        if project is None:
+            db.close()
+            return
+        metadata = dict(project.metadata)
+        metadata.pop("watchers", None)
+        updated = project.__class__(
+            project_id=project.project_id,
+            canonical_root=project.canonical_root,
+            schema_version=project.schema_version,
+            indexer_version=project.indexer_version,
+            indexing_state=project.indexing_state,
+            configuration_fingerprint=project.configuration_fingerprint,
+            last_indexed_at=project.last_indexed_at,
+            indexed_files=project.indexed_files,
+            indexed_entities=project.indexed_entities,
+            indexed_markdown_sections=project.indexed_markdown_sections,
+            health=project.health,
+            metadata=metadata,
+        )
+        with db.transaction():
+            repo.upsert(updated)
+        db.close()
+        # Also update central registry
+        try:
+            central_db = ensure_central_db(self.config)
+            central_repo = ProjectRepository(central_db._connection)
+            with central_db.transaction():
+                central_repo.upsert(updated)
+            central_db.close()
+        except Exception as e:
+            logger.warning("Failed to remove watcher config from central registry: %s", e)
 
     def canonical_root(self, project_root: str | Path) -> Path:
         root = canonical_project_root(project_root)
@@ -180,19 +312,62 @@ class ProjectManager:
         return db, metadata, repos
 
     def search(
-        self, project_root: Path, query: str, *, kind: str = "all", limit: int = 20
+        self,
+        project_root: Path,
+        query: str,
+        *,
+        kind: str = "all",
+        limit: int = 20,
+        path: str | None = None,
     ) -> dict[str, Any]:
         root = self.canonical_root(project_root)
-        logger.debug("search :: query=%s, kind=%s, limit=%s", query, kind, limit)
+        logger.debug(
+            "search :: query=%s, kind=%s, limit=%s, path=%s", query, kind, limit, path
+        )
+        if path:
+            path = _normalize_path(path)
         db, _, repos = self._open_retrieval(root)
         try:
             max_limit = self.config.search_limit_max
             results = SearchEngine(
                 repos, embedding_provider=self._embedding_provider
             ).search(
-                query, kind=kind, limit=min(limit, max_limit)
+                query, kind=kind, limit=min(limit, max_limit), path=path
             )
-            return {"query": query, "results": results, "total": len(results)}
+            return {"query": query, "path": path, "results": results, "total": len(results)}
+        finally:
+            db.close()
+
+    def search_batch(
+        self,
+        project_root: Path,
+        keywords: list[str],
+        *,
+        kind: str = "all",
+        limit: int = 20,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        root = self.canonical_root(project_root)
+        logger.debug(
+            "search_batch :: keywords=%s, kind=%s, limit=%s, path=%s",
+            keywords, kind, limit, path,
+        )
+        if path:
+            path = _normalize_path(path)
+        db, _, repos = self._open_retrieval(root)
+        try:
+            max_limit = self.config.search_limit_max
+            results = SearchEngine(
+                repos, embedding_provider=self._embedding_provider
+            ).search_many(
+                keywords, kind=kind, limit=min(limit, max_limit), path=path
+            )
+            return {
+                "keywords": list(keywords),
+                "path": path,
+                "results": results,
+                "total": len(results),
+            }
         finally:
             db.close()
 
@@ -446,22 +621,8 @@ class ProjectManager:
                     "message": "Already watching",
                 }
 
-        from ..watcher.debounce import Debouncer
-        from ..watcher.service import FileWatcher
-
-        debouncer = Debouncer(
-            delay=0.5,
-            callback=lambda _path: self.refresh_index(root),
-        )
-        watcher = FileWatcher(
-            root,
-            callback=lambda p: debouncer.submit(str(p)),
-            interval_seconds=interval,
-        )
-        watcher.start()
-
-        with self._watchers_lock:
-            self._watchers[key] = {"watcher": watcher, "debouncer": debouncer}
+        self._start_watcher_internal(root, interval)
+        self._save_watcher_config(root, interval)
 
         return {"project": str(root), "watching": True}
 
@@ -477,6 +638,7 @@ class ProjectManager:
 
         entry["debouncer"].close()
         entry["watcher"].stop()
+        self._remove_watcher_config(root)
         return {"project": str(root), "watching": False}
 
     def list_watching(self) -> dict[str, Any]:

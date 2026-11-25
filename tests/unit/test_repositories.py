@@ -274,6 +274,66 @@ class TestRepositoryStore:
         for r in text + symbols:
             assert not r["path"].startswith("file:")
 
+    def test_search_symbols_path_filter(self, database):
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:a.py", "proj1", "a.py", "a.py", "python", "h", "h"),
+        )
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:b.py", "proj1", "b.py", "b.py", "python", "h", "h"),
+        )
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store.upsert_entity(_make_entity("py:foo", file_id="file:a.py"))
+        store.upsert_entity(_make_entity("py:bar", file_id="file:b.py"))
+        assert len(store.search_symbols("foo", path="b.py")) == 0
+        assert len(store.search_symbols("foo", path="a.py")) == 1
+        assert len(store.search_symbols("foo")) == 1
+
+    def test_search_text_path_filter(self, database):
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:a.py", "proj1", "a.py", "a.py", "python", "h", "h"),
+        )
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:b.py", "proj1", "b.py", "b.py", "python", "h", "h"),
+        )
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store.upsert_entity(_make_entity("py:foo", file_id="file:a.py"))
+        store.upsert_entity(_make_entity("py:bar", file_id="file:b.py"))
+        only_a = store.search_text("foo", path="a.py")
+        assert only_a, "expected at least one FTS hit inside a.py"
+        for r in only_a:
+            assert r["path"] == "a.py"
+
+    def test_search_headings_path_filter(self, database):
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:doc.md", "proj1", "doc.md", "doc.md", "markdown", "h", "h"),
+        )
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:other.md", "proj1", "other.md", "other.md", "markdown", "h", "h"),
+        )
+        for fpath in ("doc.md", "other.md"):
+            database.connection.execute(
+                "INSERT INTO markdown_sections"
+                " (section_id, project_id, file_id, heading, heading_level,"
+                " heading_path, start_line, end_line, content_hash,"
+                " exact_source_hash, semantic_hash, source)"
+                " VALUES (?, ?, ?, ?, 1, ?, 1, 3, 'ch', 'eh', 'sh', 'Install')",
+                (f"md:sec:{fpath}", "proj1", f"file:{fpath}", "Install", "Install"),
+            )
+        database.connection.commit()
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        doc_only = store.search_headings("Install", path="doc.md")
+        assert len(doc_only) == 1
+        assert doc_only[0]["entity_id"] == "md:sec:doc.md"
+
     def test_list_entities(self, database):
         self._ensure_file(database)
         store = RepositoryStore(database.connection)

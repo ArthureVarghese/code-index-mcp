@@ -58,7 +58,9 @@ class TestSymbolSearch:
         ss = SymbolSearch(repos)
         results = ss.search("foo")
         assert len(results) == 1
-        repos.search_symbols.assert_called_once_with("foo", kind="all", limit=20)
+        repos.search_symbols.assert_called_once_with(
+            "foo", kind="all", limit=20, path=None
+        )
 
     def test_search_kind_passthrough(self):
         repos = MagicMock()
@@ -66,7 +68,7 @@ class TestSymbolSearch:
         ss = SymbolSearch(repos)
         ss.search("incremental", kind="markdown")
         repos.search_symbols.assert_called_once_with(
-            "incremental", kind="markdown", limit=20
+            "incremental", kind="markdown", limit=20, path=None
         )
 
 
@@ -166,5 +168,93 @@ class TestSearchEngine:
         engine = SearchEngine(repos)
         engine.search("incremental", kind="markdown")
         repos.search_symbols.assert_called_once_with(
-            "incremental", kind="markdown", limit=10
+            "incremental", kind="markdown", limit=10, path=None
+        )
+
+    def test_search_forwards_path_to_backends(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = []
+        repos.search_text.return_value = []
+        repos.search_headings.return_value = []
+        engine = SearchEngine(repos)
+        engine.search("auth", kind="all", path="src/auth.py")
+        repos.search_symbols.assert_called_once_with(
+            "auth", kind="all", limit=10, path="src/auth.py"
+        )
+        repos.search_text.assert_called_once_with(
+            "auth", kind="all", limit=10, path="src/auth.py"
+        )
+        repos.search_headings.assert_called_once_with(
+            "auth", limit=10, path="src/auth.py"
+        )
+
+
+class TestSearchEngineBatch:
+    def test_search_many_deduplicates_and_tags(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = [
+            {"entity_id": "e1", "name": "foo", "score": 1.0}
+        ]
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        results = engine.search_many(["foo", "bar"])
+        entity_ids = [r["entity_id"] for r in results]
+        assert entity_ids.count("e1") == 1
+        assert "keywords" in results[0]
+
+    def test_search_many_sums_scores_for_shared_entity(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = [
+            {"entity_id": "e1", "name": "token", "score": 2.0}
+        ]
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        results = engine.search_many(["token", "token"])
+        assert len(results) == 1
+        assert results[0]["keywords"] == ["token"]
+        assert float(results[0]["score"]) > 2.0
+
+    def test_search_many_merges_different_entities(self):
+        repos = MagicMock()
+        repos.search_symbols.side_effect = lambda q, **kw: [
+            {"entity_id": f"e:{q}", "name": q, "score": 1.0}
+        ]
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        results = engine.search_many(["foo", "baz"])
+        ids = {r["entity_id"] for r in results}
+        assert ids == {"e:foo", "e:baz"}
+
+    def test_search_many_empty_and_blank_keywords(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = []
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        assert engine.search_many([]) == []
+        assert engine.search_many(["", "   "]) == []
+
+    def test_search_many_respects_limit(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = [
+            {"entity_id": "e1", "name": "a", "score": 1.0},
+            {"entity_id": "e2", "name": "b", "score": 2.0},
+            {"entity_id": "e3", "name": "c", "score": 3.0},
+        ]
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        results = engine.search_many(["a", "b"], limit=2)
+        assert len(results) <= 2
+
+    def test_search_many_forwards_path(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = []
+        repos.search_text.return_value = []
+        repos.search_headings.return_value = []
+        engine = SearchEngine(repos)
+        engine.search_many(["auth", "token"], path="src/auth.py")
+        repos.search_symbols.assert_any_call(
+            "auth", kind="all", limit=10, path="src/auth.py"
+        )
+        repos.search_symbols.assert_any_call(
+            "token", kind="all", limit=10, path="src/auth.py"
         )

@@ -6,6 +6,11 @@ from typing import Any
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 
 
+def tokenize(text: str) -> list[str]:
+    """Split a query string into keyword tokens (identifiers/dotted names)."""
+    return _TOKEN_RE.findall(text)
+
+
 class FTSSearch:
     """SQLite FTS-backed search with a safe fallback."""
 
@@ -18,6 +23,7 @@ class FTSSearch:
         *,
         kind: str = "all",
         limit: int = 20,
+        path: str | None = None,
     ) -> list[dict[str, Any]]:
         tokens = _TOKEN_RE.findall(query)
 
@@ -28,4 +34,5 @@ class FTSSearch:
             " ".join(tokens),
             kind=kind,
             limit=limit,
+            path=path,
         )

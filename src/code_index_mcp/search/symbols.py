@@ -13,5 +13,8 @@ class SymbolSearch:
         *,
         kind: str = "all",
         limit: int = 20,
+        path: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self.repositories.search_symbols(query, kind=kind, limit=limit)
+        return self.repositories.search_symbols(
+            query, kind=kind, limit=limit, path=path
+        )
