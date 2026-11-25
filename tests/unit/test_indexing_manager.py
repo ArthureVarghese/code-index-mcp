@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from code_index_mcp.config import IndexConfig
 from code_index_mcp.indexing.manager import (
     IndexManager,
     _entity_hash,
@@ -11,6 +12,7 @@ from code_index_mcp.indexing.manager import (
     _entity_type,
 )
 from code_index_mcp.indexing.markdown.analyzer import MarkdownAnalyzer
+from code_index_mcp.indexing.python import analyzer as python_analyzer_module
 from code_index_mcp.indexing.python.analyzer import PythonAnalyzer
 from code_index_mcp.models.entities import Entity, EntityType, SourceKind
 
@@ -62,6 +64,23 @@ class TestDiscoverFiles:
         assert len(files) == 1
         assert files[0].name == "code.py"
 
+    def test_excluded_directories_pruned_and_size_enforced(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "hidden.py").write_text("x = 1\n")
+        (tmp_path / "ok.py").write_text("x = 1\n")
+        (tmp_path / "big.py").write_text("x = " + "1" * 20)
+
+        pm = IndexManager(
+            MagicMock(),
+            PythonAnalyzer(),
+            MarkdownAnalyzer(),
+            MagicMock(),
+            config=IndexConfig(max_file_size_bytes=10),
+        )
+
+        files = pm._discover_files(tmp_path)
+        assert [path.name for path in files] == ["ok.py"]
+
 
 class TestEntityReuse:
     def test_unchanged_hash_reuses_entity(self, tmp_path):
@@ -71,7 +90,10 @@ class TestEntityReuse:
 
         content = "x = 1\n"
         file_hash = sha256_text(content)
-        repos.get_file.return_value = {"content_hash": file_hash}
+        repos.get_file.return_value = {
+            "exact_hash": file_hash,
+            "metadata_json": '{"entity_count": 1}',
+        }
         pm = IndexManager(db, PythonAnalyzer(), MarkdownAnalyzer(), repos)
         (tmp_path / "a.py").write_text(content)
         result = pm.index_project(tmp_path)
@@ -142,6 +164,54 @@ class TestHelperFunctions:
     def test_entity_type_object_no_value(self):
         obj = MagicMock(spec=[])  # no entity_type attribute
         assert _entity_type(obj) == ""
+
+
+class TestRelationshipPerformance:
+    def test_python_file_parsed_once_and_resolver_built_once(self, tmp_path, monkeypatch):
+        (tmp_path / "a.py").write_text("def f():\n    return 1\n")
+        repos = MagicMock()
+        repos.get_file.return_value = None
+        repos.get_entities_for_file.return_value = []
+        repos.list_entities.return_value = []
+
+        calls = []
+        original_parse = python_analyzer_module.ast.parse
+
+        def counted_parse(*args, **kwargs):
+            calls.append(1)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(python_analyzer_module.ast, "parse", counted_parse)
+
+        pm = IndexManager(MagicMock(), PythonAnalyzer(), MarkdownAnalyzer(), repos)
+        result = pm.index_project(tmp_path)
+
+        assert len(calls) == 1
+        assert repos.list_entities.call_count == 1
+        assert result["errors"] == []
+
+    def test_disabled_relationships_skip_resolver_and_analysis(self, tmp_path, monkeypatch):
+        (tmp_path / "a.py").write_text("f()\n")
+        repos = MagicMock()
+        repos.get_file.return_value = None
+        repos.get_entities_for_file.return_value = []
+
+        pm = IndexManager(
+            MagicMock(),
+            PythonAnalyzer(),
+            MarkdownAnalyzer(),
+            repos,
+            config=IndexConfig(enable_relationships=False),
+        )
+        monkeypatch.setattr(
+            pm._relationship_pipeline,
+            "analyze_python",
+            lambda **kwargs: pytest.fail("relationship analysis should be skipped"),
+        )
+
+        result = pm.index_project(tmp_path)
+        assert result["relationships_computed"] == 0
+        repos.list_entities.assert_not_called()
 
 
 class TestCanReuseEntity:

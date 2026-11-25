@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from code_index_mcp.models.entities import (
@@ -201,6 +203,40 @@ class TestRepositoryStore:
         store = RepositoryStore(database.connection)
         assert store.get_file("missing.py") is None
 
+    def _ensure_doc(self, db, document_id="doc1"):
+        db.connection.execute(
+            """INSERT INTO search_documents
+                (document_id, project_id, entity_id, section_id, source_kind,
+                 title, path, content, keywords, metadata_json)
+               VALUES (?, 'proj1', NULL, NULL, 'python', 't', 'p', '', '', '{}')""",
+            (document_id,),
+        )
+
+    def test_batch_embedding_lookup(self, database):
+        self._ensure_doc(database)
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store.store_embedding("h1", "p", "m", "1", [1.0], document_id="doc1")
+
+        key = "emb:h1:p:m:1"
+        assert store.get_embeddings_by_cache_keys([key, "emb:missing:p:m:1"]) == {
+            key: [1.0]
+        }
+
+    def test_batch_summary_lookup_and_version_scope(self, database):
+        self._ensure_doc(database)
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store.store_summary(
+            "sh", "mh", "p", "m", "1", "prompt", "summary", document_id="doc1"
+        )
+
+        key = "sum:sh:p:m:1:prompt"
+        assert store.get_summaries_by_cache_keys([key]) == {key: "summary"}
+        assert (
+            store.get_summary("sh", "mh", "p", "m", "2", "prompt") is None
+        )
+
     def test_upsert_entity(self, database):
         self._ensure_file(database)
         store = RepositoryStore(database.connection)
@@ -274,6 +310,36 @@ class TestRepositoryStore:
         for r in text + symbols:
             assert not r["path"].startswith("file:")
 
+    def test_search_text_uses_one_select_for_twenty_results(self, database):
+        self._ensure_file(database)
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        for index in range(20):
+            store.upsert_entity(_make_entity(f"e{index}"))
+        store._project_id()
+
+        traced: list[str] = []
+        database.connection.set_trace_callback(traced.append)
+        try:
+            results = store.search_text("foo", limit=20)
+        finally:
+            database.connection.set_trace_callback(None)
+
+        selects = [sql for sql in traced if sql.lstrip().upper().startswith("SELECT")]
+        assert len(results) == 20
+        assert len(selects) == 1
+
+    def test_search_symbols_preserves_paths_starting_with_prefix_characters(self, database):
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:error.py", "proj1", "error.py", "error.py", "python", "h", "h"),
+        )
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store.upsert_entity(_make_entity("py:foo", file_id="file:error.py"))
+
+        assert [r["path"] for r in store.search_symbols("foo")] == ["error.py"]
+
     def test_search_symbols_path_filter(self, database):
         database.connection.execute(
             _INSERT_FILES_SQL,
@@ -333,6 +399,35 @@ class TestRepositoryStore:
         doc_only = store.search_headings("Install", path="doc.md")
         assert len(doc_only) == 1
         assert doc_only[0]["entity_id"] == "md:sec:doc.md"
+
+    def test_search_headings_uses_one_select_for_twenty_results(self, database):
+        database.connection.execute(
+            _INSERT_FILES_SQL,
+            ("file:doc.md", "proj1", "doc.md", "doc.md", "markdown", "h", "h"),
+        )
+        for index in range(20):
+            database.connection.execute(
+                "INSERT INTO markdown_sections"
+                " (section_id, project_id, file_id, heading, heading_level,"
+                " heading_path, start_line, end_line, content_hash,"
+                " exact_source_hash, semantic_hash, source)"
+                " VALUES (?, ?, ?, ?, 1, ?, 1, 3, 'ch', 'eh', 'sh', 'Install')",
+                (f"md:sec:{index}", "proj1", "file:doc.md", "Install", "Install"),
+            )
+        store = RepositoryStore(database.connection)
+        store.set_project_id("proj1")
+        store._project_id()
+
+        traced: list[str] = []
+        database.connection.set_trace_callback(traced.append)
+        try:
+            results = store.search_headings("Install", limit=20)
+        finally:
+            database.connection.set_trace_callback(None)
+
+        selects = [sql for sql in traced if sql.lstrip().upper().startswith("SELECT")]
+        assert len(results) == 20
+        assert len(selects) == 1
 
     def test_list_entities(self, database):
         self._ensure_file(database)
@@ -401,3 +496,126 @@ class TestRepositoryStore:
         store = RepositoryStore(database.connection)
         with pytest.raises((KeyError, FileNotFoundError)):
             store.get_file_region("code.py", 1, 5)
+
+
+def _select_count(connection, operation):
+    count = 0
+
+    def trace(sql: str) -> None:
+        nonlocal count
+        if sql.strip().upper().startswith("SELECT"):
+            count += 1
+
+    connection.set_trace_callback(trace)
+    try:
+        result = operation()
+    finally:
+        connection.set_trace_callback(None)
+    return result, count
+
+
+def _seed_entities(database, count: int) -> None:
+    database.connection.execute(
+        _INSERT_FILES_SQL,
+        ("file:f1.py", "proj1", "f1.py", "f1.py", "python", "h", "h"),
+    )
+    repo = EntityRepository(database.connection)
+    for index in range(count):
+        entity = _make_entity(f"e{index}")
+        repo.upsert(
+            replace(
+                entity,
+                source_range=replace(
+                    entity.source_range,
+                    start_line=index + 1,
+                    end_line=index + 1,
+                ),
+            )
+        )
+
+
+def _query_plan(connection, sql: str, params=()) -> str:
+    rows = connection.execute(
+        f"EXPLAIN QUERY PLAN {sql}",
+        params,
+    ).fetchall()
+    return " | ".join(row["detail"] for row in rows)
+
+
+def test_list_all_uses_one_select(database):
+    _seed_entities(database, 200)
+
+    entities, selects = _select_count(database.connection, EntityRepository(
+        database.connection
+    ).list_all)
+
+    assert len(entities) == 200
+    assert selects == 1
+    assert [e.name for e in entities[:3]] == ["e0", "e1", "e2"]
+
+
+def test_repository_store_list_helpers_use_one_select(database):
+    _seed_entities(database, 200)
+    store = RepositoryStore(database.connection)
+    store.set_project_id("proj1")
+    parent = _make_entity("parent")
+    store.entities.upsert(replace(parent, parent_id=None))
+    store.entities.upsert(replace(_make_entity("child"), parent_id="parent"))
+
+    entities, selects = _select_count(database.connection, store.list_entities)
+    children, child_selects = _select_count(
+        database.connection, lambda: store.get_children("parent")
+    )
+    file_entities, file_selects = _select_count(
+        database.connection, lambda: store.get_entities_for_file("f1.py")
+    )
+
+    assert len(entities) >= 200
+    assert selects == 1
+    assert [c["entity_id"] for c in children] == ["child"]
+    assert child_selects == 1
+    assert len(file_entities) >= 200
+    assert file_selects == 1
+
+
+def test_hot_lookups_use_indexes(database):
+    plans = {
+        "files": _query_plan(
+            database.connection,
+            "SELECT file_id FROM files WHERE relative_path = ? AND project_id = ?",
+            ("f1.py", "proj1"),
+        ),
+        "embeddings": _query_plan(
+            database.connection,
+            "SELECT vector_json FROM embeddings"
+            " WHERE semantic_hash=? AND provider=?"
+            " AND model=? AND representation_version=?",
+            ("s", "p", "m", "v"),
+        ),
+        "summaries": _query_plan(
+            database.connection,
+            "SELECT summary FROM summaries"
+            " WHERE semantic_hash=? AND metadata_hash=?"
+            " AND provider=? AND model=? AND prompt_version=?",
+            ("s", "m", "p", "model", "prompt"),
+        ),
+        "search_documents": _query_plan(
+            database.connection,
+            "SELECT entity_id FROM search_documents WHERE entity_id = ?",
+            ("e1",),
+        ),
+        "markdown_sections": _query_plan(
+            database.connection,
+            "SELECT * FROM markdown_sections WHERE project_id = ? AND heading_path = ?",
+            ("proj1", "Guide/Install"),
+        ),
+        "entities_for_file": _query_plan(
+            database.connection,
+            "SELECT * FROM entities WHERE file_id = ?"
+            " ORDER BY start_line, start_column, end_line",
+            ("file:f1.py",),
+        ),
+    }
+
+    for name, plan in plans.items():
+        assert "USING INDEX" in plan or "SEARCH" in plan, f"{name}: {plan}"

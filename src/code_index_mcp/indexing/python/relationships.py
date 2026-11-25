@@ -116,6 +116,21 @@ class PythonRelationshipAnalyzer(ast.NodeVisitor):
 
 
 def _name_of(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+
+    if isinstance(node, ast.Attribute):
+        parts: list[str] = []
+        current: ast.AST = node
+
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            return ".".join(reversed(parts))
+
     try:
         return ast.unparse(node)
     except Exception:

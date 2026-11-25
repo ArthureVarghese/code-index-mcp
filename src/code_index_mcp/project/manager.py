@@ -38,6 +38,61 @@ def _normalize_path(path: str) -> str:
     return path
 
 
+class _SynchronizedCursor:
+    def __init__(self, cursor: Any, lock: Any) -> None:
+        self._cursor = cursor
+        self._lock = lock
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._cursor, name)
+        if not callable(value):
+            return value
+
+        def synchronized(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return value(*args, **kwargs)
+
+        return synchronized
+
+
+class _SynchronizedConnection:
+    def __init__(self, connection: Any, lock: Any) -> None:
+        self._connection = connection
+        self._lock = lock
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return _SynchronizedCursor(self._connection.execute(*args, **kwargs), self._lock)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return _SynchronizedCursor(
+                self._connection.executemany(*args, **kwargs), self._lock
+            )
+
+    def commit(self) -> None:
+        with self._lock:
+            self._connection.commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._connection.rollback()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _BorrowedDatabase:
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def close(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._database, name)
+
+
 def _validate_verbosity(context: str) -> str:
     """Normalize and validate a verbosity level for list/context tools."""
     if context not in ("minimal", "normal", "full"):
@@ -76,6 +131,10 @@ class ProjectManager:
         self._summary_provider = None
         self._watchers: dict[str, Any] = {}
         self._watchers_lock = threading.Lock()
+        self._path_cache_lock = threading.RLock()
+        self._root_cache: dict[str, Path] = {}
+        self._project_id_cache: dict[str, str] = {}
+        self._services_cache: dict[str, tuple[Database, RepositoryStore, str]] = {}
         self._restore_watchers()
 
     def _restore_watchers(self) -> None:
@@ -117,6 +176,9 @@ class ProjectManager:
             root,
             callback=lambda p: debouncer.submit(str(p)),
             interval_seconds=interval,
+            ignore=IgnoreMatcher(root, self.config),
+            extensions=self.config.extensions,
+            excluded_directories=self.config.excluded_directories,
         )
         watcher.start()
 
@@ -206,6 +268,12 @@ class ProjectManager:
             logger.warning("Failed to remove watcher config from central registry: %s", e)
 
     def canonical_root(self, project_root: str | Path) -> Path:
+        key = str(Path(project_root).resolve())
+        with self._path_cache_lock:
+            cached = self._root_cache.get(key)
+        if cached is not None and cached.is_dir():
+            return cached
+
         root = canonical_project_root(project_root)
         if not root.is_dir():
             raise ValueError(f"Project root is not a directory: {root}")
@@ -213,10 +281,38 @@ class ProjectManager:
             ProjectPathGuard(root)
         except PathSecurityError as exc:
             raise ValueError(f"Invalid project root: {exc}") from exc
+
+        with self._path_cache_lock:
+            self._root_cache[key] = root
         return root
 
     def project_id(self, project_root: str | Path) -> str:
-        return project_id_for_root(self.canonical_root(project_root))
+        root = self.canonical_root(project_root)
+        key = str(root)
+
+        with self._path_cache_lock:
+            cached = self._project_id_cache.get(key)
+        if cached is not None:
+            return cached
+
+        project_id = project_id_for_root(root)
+        with self._path_cache_lock:
+            self._project_id_cache[key] = project_id
+        return project_id
+
+    def _invalidate_project_cache(self, root: Path) -> None:
+        key = str(root)
+        with self._path_cache_lock:
+            self._root_cache = {
+                cache_key: cached
+                for cache_key, cached in self._root_cache.items()
+                if cached != root
+            }
+            self._project_id_cache.pop(key, None)
+            entry = self._services_cache.pop(key, None)
+
+        if entry is not None:
+            entry[0].close()
 
     def database_path(self, project_root: str | Path) -> Path:
         return self.config.project_directory(self.project_id(project_root)) / "index.db"
@@ -233,13 +329,15 @@ class ProjectManager:
         repos = RepositoryStore(db.connection)
         repos.set_project_id(metadata.project_id)
         from ..cache.manager import CacheManager
-        cache_mgr = CacheManager(db.connection)
+        cache_mgr = CacheManager(db.connection, enabled=False)
+        ignore = IgnoreMatcher(root, self.config)
         indexer = IndexManager(
             db, PythonAnalyzer(), MarkdownAnalyzer(), repos,
-            ignore=IgnoreMatcher(root, self.config),
+            ignore=ignore,
             embedding_provider=self._embedding_provider,
             summary_provider=self._summary_provider,
             cache_manager=cache_mgr,
+            config=self.config,
         )
         return db, metadata, repos, indexer
 
@@ -307,9 +405,26 @@ class ProjectManager:
     def refresh_index(self, project_root: Path) -> dict[str, Any]:
         return self.index_project(project_root, force=False)
 
+    def _read_services(self, root: Path) -> tuple[Database, RepositoryStore, str]:
+        key = str(root)
+
+        with self._path_cache_lock:
+            cached = self._services_cache.get(key)
+            if cached is not None:
+                return cached
+
+            db = Database(self.database_path(root))
+            connection = _SynchronizedConnection(db.connection, self._path_cache_lock)
+            repos = RepositoryStore(connection)
+            project_id = self.project_id(root)
+            repos.set_project_id(project_id)
+            entry = (db, repos, project_id)
+            self._services_cache[key] = entry
+            return entry
+
     def _open_retrieval(self, root: Path):
-        db, metadata, repos, _ = self._services(root)
-        return db, metadata, repos
+        db, repos, _ = self._read_services(root)
+        return _BorrowedDatabase(db), None, repos
 
     def search(
         self,
@@ -580,7 +695,7 @@ class ProjectManager:
 
     def get_index_status(self, project_root: Path) -> dict[str, Any]:
         root = self.canonical_root(project_root)
-        db = self.open_database(root)
+        db, _, _ = self._open_retrieval(root)
         try:
             metadata = ensure_project_metadata(db, root, self.config)
             status = metadata.to_dict()
@@ -604,8 +719,10 @@ class ProjectManager:
     def remove_project_cache(self, project_root: str | Path) -> None:
         directory = self.project_directory(project_root)
         if not directory.exists():
+            self._invalidate_project_cache(self.canonical_root(project_root))
             return
         directory.resolve().relative_to(self.config.index_root.resolve())
+        self._invalidate_project_cache(self.canonical_root(project_root))
         import shutil
         shutil.rmtree(directory)
 

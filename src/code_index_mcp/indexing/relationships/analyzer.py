@@ -17,6 +17,7 @@ class RelationshipAnalyzer:
         entity_ids_by_qualified_name: dict[str, str],
     ) -> list[RelationshipCandidate]:
         candidates: list[RelationshipCandidate] = []
+        seen: set[tuple[str, str, str, str]] = set()
 
         analyzer = PythonRelationshipAnalyzer()
 
@@ -31,6 +32,11 @@ class RelationshipAnalyzer:
 
             if target_id is not None:
                 metadata["resolved_target"] = target_id
+
+            dedup_key = (source_id, reference.target_name, reference.kind, str(target_id or ""))
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
 
             candidates.append(
                 RelationshipCandidate(

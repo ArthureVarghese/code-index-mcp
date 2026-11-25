@@ -13,23 +13,23 @@ authors = [
     { name = "Arthure Antony" }
 ]
 dependencies = [
-    "mcp>=2.1.1",
+    "mcp>=1.2.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
 watch = [
-    "watchfiles>=1.2.0",
+    "watchfiles>=1.0.0,<2.0.0",
 ]
 semantic = [
-    "numpy>=2.5.2",
+    "numpy>=1.26,<3.0",
 ]
 dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "pytest-cov>=7.1.0",
-    "ruff>=0.16.5",
-    "mypy>=2.3.1",
-    "pytest-mock>=3.15.1"
+    "mypy>=1.14,<2.0",
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "pytest-cov>=6.0,<7.0",
+    "pytest-mock>=3.15,<4.0",
+    "ruff>=0.9,<1.0",
 ]
 
 [project.scripts]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 from code_index_mcp.cache.invalidation import calculate_invalidation
 from code_index_mcp.cache.manager import CacheManager
+from code_index_mcp.config import IndexConfig
 from code_index_mcp.indexing.entity_matcher import EntityMatcher, _is_container
 from code_index_mcp.indexing.hashing import sha256_text
 from code_index_mcp.indexing.relationships.analyzer import RelationshipAnalyzer
@@ -18,7 +20,6 @@ from code_index_mcp.indexing.versions import (
     PYTHON_ANALYZER_VERSION,
 )
 from code_index_mcp.models.entities import (
-    Entity,
     Relationship,
     RelationshipConfidence,
     RelationshipKind,
@@ -40,6 +41,25 @@ _CONFIDENCE_MAP = {
 }
 
 
+def _file_entity_count(file_row: dict | None) -> int:
+    if not file_row:
+        return 0
+
+    metadata = file_row.get("metadata_json")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+
+    if isinstance(metadata, dict):
+        count = metadata.get("entity_count")
+        if isinstance(count, int):
+            return count
+
+    return 0
+
+
 class IndexManager:
     """Coordinates incremental project indexing."""
 
@@ -54,7 +74,9 @@ class IndexManager:
         embedding_provider: Any = None,
         summary_provider: Any = None,
         cache_manager: CacheManager | None = None,
+        config: IndexConfig | None = None,
     ) -> None:
+        self.config = config or IndexConfig()
         self.db = database
         self.python_analyzer = python_analyzer
         self.markdown_analyzer = markdown_analyzer
@@ -81,16 +103,6 @@ class IndexManager:
         project_row = self.db.execute("SELECT project_id FROM projects LIMIT 1").fetchone()
         project_id = project_row["project_id"] if project_row else ""
 
-        try:
-            self.db.execute(
-                "INSERT INTO index_jobs"
-                " (job_id, project_id, state, started_at)"
-                " VALUES (?, ?, 'running', ?)",
-                (job_id, project_id, datetime.now(UTC).isoformat()),
-            )
-        except Exception:
-            logger.debug("Could not create index_job record (FK may not exist yet)")
-
         files = self._discover_files(project_root)
 
         stats: dict[str, Any] = {
@@ -108,33 +120,63 @@ class IndexManager:
             "errors": [],
         }
 
-        for path in files:
+        resolver_map = (
+            self._build_relationship_resolver_map()
+            if self.config.enable_relationships
+            else {}
+        )
+        pending_embeddings: list[Any] = []
+        pending_summaries: list[Any] = []
+
+        with self.db.transaction():
             try:
-                result = self._index_file(
-                    project_root,
-                    path,
-                    force=force,
+                self.db.execute(
+                    "INSERT INTO index_jobs"
+                    " (job_id, project_id, state, started_at)"
+                    " VALUES (?, ?, 'running', ?)",
+                    (job_id, project_id, datetime.now(UTC).isoformat()),
                 )
+            except Exception:
+                logger.debug("Could not create index_job record (FK may not exist yet)")
 
-                for key, value in result.items():
-                    if key in stats:
-                        stats[key] += value
+            for path in files:
+                try:
+                    result = self._index_file(
+                        project_root,
+                        path,
+                        force=force,
+                        resolver_map=resolver_map,
+                        pending_embeddings=pending_embeddings,
+                        pending_summaries=pending_summaries,
+                    )
 
-            except Exception as exc:
-                logger.exception("Failed to index %s", path)
+                    for key, value in result.items():
+                        if key in stats:
+                            stats[key] += value
 
-                stats["errors"].append(
-                    {
-                        "path": str(path),
-                        "error": str(exc),
-                    }
-                )
+                except Exception as exc:
+                    logger.exception("Failed to index %s", path)
 
+                    stats["errors"].append(
+                        {
+                            "path": str(path),
+                            "error": str(exc),
+                        }
+                    )
+
+            stats["indexer_version"] = INDEXER_VERSION
+            stats["job_id"] = job_id
+            self._finalize_index_job(job_id, project_id, stats)
+
+        self._enrich_entities(pending_embeddings, pending_summaries, stats)
         stats["duration_seconds"] = time.monotonic() - started
-        stats["indexer_version"] = INDEXER_VERSION
-        stats["job_id"] = job_id
+        self._finalize_index_job(job_id, project_id, stats)
 
-        completed_at = datetime.now(UTC).isoformat()
+        return stats
+
+    def _finalize_index_job(
+        self, job_id: str, project_id: str, stats: dict[str, Any]
+    ) -> None:
         try:
             self.db.execute(
                 """UPDATE index_jobs SET
@@ -145,7 +187,7 @@ class IndexManager:
                 WHERE job_id=?""",
                 (
                     "completed" if not stats["errors"] else "failed",
-                    completed_at,
+                    datetime.now(UTC).isoformat(),
                     stats["files_seen"],
                     stats["files_changed"],
                     stats["files_reused"],
@@ -161,33 +203,128 @@ class IndexManager:
         except Exception:
             logger.debug("Could not update index_job record")
 
-        return stats
+    def _enrich_entities(
+        self,
+        pending_embeddings: list[Any],
+        pending_summaries: list[Any],
+        stats: dict[str, Any],
+    ) -> None:
+        if not pending_embeddings and not pending_summaries:
+            return
+
+        if pending_embeddings and self._embedding_provider:
+            try:
+                from code_index_mcp.embeddings.cache import EmbeddingCache
+
+                cache = EmbeddingCache(self.repositories, self._embedding_provider)
+                _, embedding_entries, reused, recomputed = cache.prepare_many(
+                    [
+                        (entity.semantic_hash, entity.source, f"entity:{entity.entity_id}")
+                        for entity in pending_embeddings
+                    ]
+                )
+                with self.db.transaction():
+                    cache.store_many(embedding_entries)
+                stats["embeddings_reused"] += reused
+                stats["embeddings_recomputed"] += recomputed
+            except Exception:
+                logger.exception("Batch embedding enrichment failed")
+
+        if pending_summaries and self._summary_provider:
+            try:
+                from code_index_mcp.summaries.cache import SummaryCache
+
+                summary_cache = SummaryCache(self.repositories, self._summary_provider)
+                _, summary_entries, reused, recomputed = summary_cache.prepare_many(
+                    [
+                        (
+                            entity.semantic_hash,
+                            entity.semantic_hash,
+                            entity.source,
+                            {
+                                "name": entity.name,
+                                "entity_type": entity.entity_type.value,
+                            },
+                            f"entity:{entity.entity_id}",
+                        )
+                        for entity in pending_summaries
+                    ]
+                )
+                with self.db.transaction():
+                    summary_cache.store_many(summary_entries)
+                stats["summaries_reused"] += reused
+                stats["summaries_recomputed"] += recomputed
+            except Exception:
+                logger.exception("Batch summary enrichment failed")
 
     def refresh_index(self, project_root: Path) -> dict[str, Any]:
         return self.index_project(project_root, force=False)
 
     def _discover_files(self, root: Path) -> list[Path]:
         result: list[Path] = []
+        root = root.resolve()
+        extensions = self.config.extensions
+        excluded_directories = self.config.excluded_directories
+        excluded_files = self.config.excluded_files
+        max_size = self.config.max_file_size_bytes
 
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
+        def walk(directory: Path) -> None:
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                return
 
-            if path.is_symlink():
-                continue
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
 
-            if self.ignore and self.ignore.is_ignored(path):
-                continue
+                    path = Path(entry.path)
 
-            if path.suffix.lower() in {
-                ".py",
-                ".pyi",
-                ".md",
-                ".markdown",
-            }:
-                result.append(path)
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in excluded_directories:
+                            continue
+                        if self.ignore and self.ignore.is_ignored_dir(path):
+                            continue
+                        walk(path)
+                        continue
 
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+
+                    if entry.name in excluded_files:
+                        continue
+
+                    if path.suffix.lower() not in extensions:
+                        continue
+
+                    if entry.stat(follow_symlinks=False).st_size > max_size:
+                        continue
+
+                    if self.ignore and self.ignore.is_ignored(path):
+                        continue
+
+                    result.append(path)
+                except OSError:
+                    continue
+
+        walk(root)
         return sorted(result)
+
+    def _build_relationship_resolver_map(self) -> dict[str, str]:
+        resolver: dict[str, str] = {}
+
+        for entity in self.repositories.list_entities():
+            entity_id = entity.get("entity_id", "")
+            qualified_name = entity.get("qualified_name", "")
+            name = entity.get("name", "")
+
+            if qualified_name and entity_id:
+                resolver[qualified_name] = entity_id
+            if name and entity_id and name not in resolver:
+                resolver[name] = entity_id
+
+        return resolver
 
     def _index_file(
         self,
@@ -195,6 +332,9 @@ class IndexManager:
         path: Path,
         *,
         force: bool,
+        resolver_map: dict[str, str],
+        pending_embeddings: list[Any],
+        pending_summaries: list[Any],
     ) -> dict[str, int]:
         relative = path.relative_to(root).as_posix()
 
@@ -205,13 +345,18 @@ class IndexManager:
 
         file_hash = sha256_text(source)
         previous = self.repositories.get_file(relative)
+        previous_hash = (
+            (previous.get("exact_hash") or previous.get("content_hash"))
+            if previous
+            else None
+        )
 
-        if not force and previous and previous.get("content_hash") == file_hash:
+        if not force and previous and previous_hash == file_hash:
             return {
                 "files_reused": 1,
                 "files_changed": 0,
                 "files_parsed": 0,
-                "entities_reused": 0,
+                "entities_reused": _file_entity_count(previous),
                 "entities_recomputed": 0,
             }
 
@@ -248,8 +393,8 @@ class IndexManager:
             return {
                 "files_reused": 1,
                 "files_changed": 0,
-                "files_parsed": 0,
-                "entities_reused": 0,
+                "files_parsed": 1,
+                "entities_reused": len(old_entities),
                 "entities_recomputed": 0,
             }
 
@@ -269,12 +414,15 @@ class IndexManager:
             "summaries_recomputed": 0,
         }
 
-        with self.db.transaction():
+        with self.db.savepoint():
             self.repositories.upsert_file(
                 relative,
                 file_hash,
                 len(analyzed.entities),
             )
+
+            changed_entities: list[Any] = []
+            old_content_hashes: dict[str, str | None] = {}
 
             for entity in analyzed.entities:
                 old = matched.get(entity.entity_id)
@@ -283,9 +431,15 @@ class IndexManager:
                     result["entities_reused"] += 1
                     continue
 
-                old_content_hash = _entity_hash(old) if old else None
-                self.repositories.upsert_entity(entity)
+                changed_entities.append(entity)
+                old_content_hashes[entity.entity_id] = _entity_hash(old) if old else None
+
+            if changed_entities:
+                self.repositories.upsert_entities(changed_entities)
+
+            for entity in changed_entities:
                 result["entities_recomputed"] += 1
+                old_content_hash = old_content_hashes.get(entity.entity_id)
 
                 self._cache_entity(entity)
 
@@ -293,27 +447,23 @@ class IndexManager:
                     self._write_entity_version(entity)
 
                 if self._embedding_provider:
-                    emb_reused = self._update_embedding(entity)
-                    if emb_reused:
-                        result["embeddings_reused"] += 1
-                    else:
-                        result["embeddings_recomputed"] += 1
+                    pending_embeddings.append(entity)
 
                 if self._summary_provider:
-                    sum_reused = self._update_summary(entity)
-                    if sum_reused:
-                        result["summaries_reused"] += 1
-                    else:
-                        result["summaries_recomputed"] += 1
+                    pending_summaries.append(entity)
 
             for entity_id in plan.removed_entities:
                 self.repositories.delete_entity(entity_id)
 
             relationships = self._compute_relationships(
-                analyzed.entities, source, relative, project_id
+                analyzed.entities,
+                getattr(analyzed, "tree", None),
+                relative,
+                project_id,
+                resolver_map,
             )
-            for rel in relationships:
-                self.repositories.relationships.upsert(rel)
+            if relationships:
+                self.repositories.relationships.upsert_many(relationships)
             result["relationships_computed"] = len(relationships)
 
             self._populate_markdown_sections(
@@ -327,27 +477,21 @@ class IndexManager:
     def _compute_relationships(
         self,
         entities: list[Any],
-        source: str,
+        tree: Any,
         relative_path: str,
         project_id: str,
+        resolver_map: dict[str, str],
     ) -> list[Relationship]:
         """Run RelationshipAnalyzer and convert RelationshipCandidates to Relationship objects."""
-        import ast
-
-        try:
-            tree = ast.parse(source, filename=relative_path)
-        except (SyntaxError, ValueError):
+        if not self.config.enable_relationships or tree is None:
             return []
 
-        entity_ids_by_qname: dict[str, str] = {}
-        for entity in self.repositories.list_entities():
-            qname = entity.get("qualified_name", "")
-            eid = entity.get("entity_id", "")
-            name = entity.get("name", "")
-            if qname:
-                entity_ids_by_qname[qname] = eid
-            if name and name not in entity_ids_by_qname:
-                entity_ids_by_qname[name] = eid
+        entity_ids_by_qname = dict(resolver_map)
+        for entity in entities:
+            if entity.qualified_name:
+                entity_ids_by_qname[entity.qualified_name] = entity.entity_id
+            if entity.name and entity.name not in entity_ids_by_qname:
+                entity_ids_by_qname[entity.name] = entity.entity_id
 
         module_entity_id = f"python:{relative_path}"
         candidates = self._relationship_pipeline.analyze_python(
@@ -525,27 +669,7 @@ class IndexManager:
             )
 
             if new_structural != container.structural_hash:
-                updated_entity = Entity(
-                    entity_id=container.entity_id,
-                    project_id=container.project_id,
-                    file_id=container.file_id,
-                    source_kind=container.source_kind,
-                    entity_type=container.entity_type,
-                    name=container.name,
-                    qualified_name=container.qualified_name,
-                    parent_id=container.parent_id,
-                    source_range=container.source_range,
-                    content_hash=container.content_hash,
-                    exact_source_hash=container.exact_source_hash,
-                    semantic_hash=container.semantic_hash,
-                    structural_hash=new_structural,
-                    source=container.source,
-                    docstring=container.docstring,
-                    signature=container.signature,
-                    decorators=container.decorators,
-                    metadata=container.metadata,
-                )
-                self.repositories.upsert_entity(updated_entity)
+                self.repositories.update_structural_hash(container.entity_id, new_structural)
 
     @staticmethod
     def _can_reuse_entity(old: Any, current: Any) -> bool:

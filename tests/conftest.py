@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from code_index_mcp.indexing.manager import IndexManager
 from code_index_mcp.indexing.markdown.analyzer import MarkdownAnalyzer
 from code_index_mcp.indexing.python.analyzer import PythonAnalyzer
 from code_index_mcp.storage.database import Database
-from code_index_mcp.storage.repositories import EntityRepository
+from code_index_mcp.storage.repositories import (
+    EntityRepository,
+    MarkdownSectionRepository,
+    RelationshipRepository,
+)
 
 
 class RepositoryAdapter:
@@ -14,6 +20,8 @@ class RepositoryAdapter:
         self.database = database
         self.project_root = project_root
         self.entities = EntityRepository(database.connection)
+        self.relationships = RelationshipRepository(database.connection)
+        self.markdown_sections = MarkdownSectionRepository(database.connection)
 
     def get_file(self, relative_path: str):
         row = self.database.connection.execute(
@@ -29,7 +37,9 @@ class RepositoryAdapter:
         if row is None:
             return None
 
-        return dict(row)
+        result = dict(row)
+        result.setdefault("content_hash", result.get("exact_hash"))
+        return result
 
     def get_entities_for_file(self, relative_path: str):
         return self.entities.list_for_file(f"file:{relative_path}")
@@ -38,6 +48,12 @@ class RepositoryAdapter:
         # The analyzers currently default project_id to "".
         # Keep the DB project/file rows consistent with that.
         self.entities.upsert(entity)
+
+    def upsert_entities(self, entities):
+        self.entities.upsert_many(entities)
+
+    def update_structural_hash(self, entity_id: str, structural_hash: str):
+        self.entities.update_structural_hash(entity_id, structural_hash)
 
     def delete_entity(self, entity_id: str):
         self.entities.delete(entity_id)
@@ -120,15 +136,20 @@ class RepositoryAdapter:
                 size_bytes,
                 mtime_ns,
                 encoding,
-                parser_version
+                parser_version,
+                metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_id) DO UPDATE SET
                 project_id = excluded.project_id,
+                canonical_path = excluded.canonical_path,
+                source_kind = excluded.source_kind,
                 exact_hash = excluded.exact_hash,
                 semantic_hash = excluded.semantic_hash,
                 size_bytes = excluded.size_bytes,
-                mtime_ns = excluded.mtime_ns
+                mtime_ns = excluded.mtime_ns,
+                parser_version = excluded.parser_version,
+                metadata_json = excluded.metadata_json
             """,
             (
                 file_id,
@@ -142,6 +163,7 @@ class RepositoryAdapter:
                 stat.st_mtime_ns,
                 "utf-8",
                 "test",
+                json.dumps({"entity_count": entity_count}),
             ),
         )
 

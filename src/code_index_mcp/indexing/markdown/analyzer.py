@@ -54,21 +54,17 @@ class MarkdownAnalyzer:
 
         entities: list[Entity] = []
         section_ids: list[str] = []
+        heading_paths = [self._heading_path(sections, index) for index in range(len(sections))]
+        duplicate_counts: dict[tuple[str, str], int] = {}
 
         for index, section in enumerate(sections):
             title = section.heading.title
-            heading_path = self._heading_path(sections, index)
+            heading_path = heading_paths[index]
 
             base_id = f"markdown:{relative_path}:{heading_path}"
-
-            duplicate_count = sum(
-                1
-                for previous_index in range(index)
-                if (
-                    sections[previous_index].heading.title == title
-                    and self._heading_path(sections, previous_index) == heading_path
-                )
-            )
+            duplicate_key = (heading_path, title)
+            duplicate_count = duplicate_counts.get(duplicate_key, 0)
+            duplicate_counts[duplicate_key] = duplicate_count + 1
 
             section_id = f"{base_id}#{duplicate_count + 1}" if duplicate_count else base_id
 

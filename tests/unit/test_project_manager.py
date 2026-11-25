@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from code_index_mcp.config import IndexConfig
+from code_index_mcp.project.identity import canonical_project_root, project_id_for_root
 from code_index_mcp.project.manager import ProjectManager
+from code_index_mcp.storage.database import Database
 
 
 @pytest.fixture
@@ -371,9 +374,70 @@ class TestProjectManagerException:
         # Second index - mock the indexer to fail
         with patch.object(manager, "_services") as mock_services:
             db = MagicMock()
-            mock_services.return_value = (db, MagicMock(), MagicMock(), MagicMock())
+            indexer = MagicMock()
+            indexer.index_project.side_effect = ValueError("boom")
+            mock_services.return_value = (db, MagicMock(), MagicMock(), indexer)
             db.execute.return_value.fetchone.return_value = {"count": 0}
             db.execute.return_value.__getitem__ = lambda self, i: 0
-            # Force an error in the try block
             with pytest.raises(ValueError):
                 manager.index_project(tmp_path)
+
+
+class TestProjectServiceCaching:
+    def test_project_paths_are_memoized(self, manager, tmp_path):
+        with (
+            patch(
+                "code_index_mcp.project.manager.canonical_project_root",
+                wraps=canonical_project_root,
+            ) as root_mock,
+            patch(
+                "code_index_mcp.project.manager.project_id_for_root",
+                wraps=project_id_for_root,
+            ) as id_mock,
+        ):
+            first = manager.project_id(tmp_path)
+            second = manager.project_id(tmp_path)
+
+        assert first == second
+        assert root_mock.call_count == 1
+        assert id_mock.call_count == 1
+
+    def test_read_calls_reuse_one_database_connection(self, manager, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        manager.index_project(tmp_path)
+
+        with patch("code_index_mcp.project.manager.Database", wraps=Database) as db_ctor:
+            first = manager.get_file_outline(tmp_path, "a.py")
+            second = manager.get_file_outline(tmp_path, "a.py")
+
+        assert first["entity_count"] == second["entity_count"]
+        assert db_ctor.call_count == 1
+        manager.clear_project_cache(tmp_path)
+
+    def test_read_calls_do_not_construct_indexing_services(self, manager, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        manager.index_project(tmp_path)
+
+        with patch.object(manager, "_services", side_effect=AssertionError):
+            result = manager.get_file_outline(tmp_path, "a.py")
+
+        assert result["entity_count"] >= 1
+        manager.clear_project_cache(tmp_path)
+
+    def test_concurrent_reads_reuse_one_connection(self, manager, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        manager.index_project(tmp_path)
+
+        with patch("code_index_mcp.project.manager.Database", wraps=Database) as db_ctor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(
+                    executor.map(
+                        lambda _: manager.get_file_outline(tmp_path, "a.py"),
+                        range(8),
+                    )
+                )
+
+        assert len(results) == 8
+        assert db_ctor.call_count == 1
+        manager.clear_project_cache(tmp_path)
+

@@ -105,7 +105,7 @@ class TestEmbeddings:
         provider.provider_name = "test"
         provider.model_name = "test-model"
         provider.version = "1"
-        provider.embed_one.return_value = [0.1, 0.2, 0.3]
+        provider.embed.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 
         manager._embedding_provider = provider
         (tmp_path / "mod.py").write_text("def foo(): pass\n")
@@ -118,22 +118,22 @@ class TestEmbeddings:
             assert len(rows) >= 1
         finally:
             db.close()
-        provider.embed_one.assert_called()
+        provider.embed.assert_called()
 
     def test_embedding_reused_from_cache(self, manager, tmp_path):
         provider = MagicMock()
         provider.provider_name = "test"
         provider.model_name = "test-model"
         provider.version = "1"
-        provider.embed_one.return_value = [0.1, 0.2, 0.3]
+        provider.embed.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 
         manager._embedding_provider = provider
         (tmp_path / "mod.py").write_text("def foo(): pass\n")
         manager.index_project(tmp_path, force=True)
-        call_count_first = provider.embed_one.call_count
+        call_count_first = provider.embed.call_count
 
         manager.index_project(tmp_path, force=True)
-        assert provider.embed_one.call_count == call_count_first
+        assert provider.embed.call_count == call_count_first
 
     def test_no_embedding_when_provider_none(self, manager, tmp_path):
         (tmp_path / "mod.py").write_text("x = 1\n")
@@ -141,6 +141,68 @@ class TestEmbeddings:
 
         assert result["embeddings_recomputed"] == 0
         assert result["embeddings_reused"] == 0
+
+    def test_embedding_provider_called_once_for_all_entities(self, manager, tmp_path):
+        provider = MagicMock()
+        provider.provider_name = "test"
+        provider.model_name = "test-model"
+        provider.version = "1"
+        provider.embed.side_effect = lambda texts: [[1.0] for _ in texts]
+
+        manager._embedding_provider = provider
+        (tmp_path / "mod.py").write_text(
+            "def alpha(): pass\n\ndef beta(): pass\n\ndef gamma(): pass\n"
+        )
+        manager.index_project(tmp_path, force=True)
+
+        assert provider.embed.call_count == 1
+        assert len(provider.embed.call_args.args[0]) >= 4
+
+    def test_embedding_provider_failure_does_not_rollback_index(self, manager, tmp_path):
+        provider = MagicMock()
+        provider.provider_name = "test"
+        provider.model_name = "test-model"
+        provider.version = "1"
+        provider.embed.side_effect = RuntimeError("embedding provider unavailable")
+
+        manager._embedding_provider = provider
+        (tmp_path / "mod.py").write_text("def foo(): pass\n")
+        result = manager.index_project(tmp_path, force=True)
+
+        assert result["entities_recomputed"] >= 1
+        assert result["embeddings_recomputed"] == 0
+        db = manager.open_database(tmp_path)
+        try:
+            assert db.execute("SELECT count(*) FROM entities").fetchone()[0] >= 1
+        finally:
+            db.close()
+
+    def test_embedding_version_bump_creates_new_cache_entries(self, manager, tmp_path):
+        provider = MagicMock()
+        provider.provider_name = "test"
+        provider.model_name = "test-model"
+        provider.version = "1"
+        provider.embed.side_effect = lambda texts: [[1.0] for _ in texts]
+
+        manager._embedding_provider = provider
+        (tmp_path / "mod.py").write_text("def foo(): pass\n")
+        manager.index_project(tmp_path, force=True)
+        db = manager.open_database(tmp_path)
+        try:
+            first_count = db.execute("SELECT count(*) FROM embeddings").fetchone()[0]
+        finally:
+            db.close()
+
+        provider.version = "2"
+        (tmp_path / "mod.py").write_text("def foo(): return 42\n")
+        manager.index_project(tmp_path, force=True)
+        db = manager.open_database(tmp_path)
+        try:
+            second_count = db.execute("SELECT count(*) FROM embeddings").fetchone()[0]
+        finally:
+            db.close()
+
+        assert second_count > first_count
 
 
 # ── Summaries ─────────────────────────────────────────────────────────────
@@ -153,7 +215,9 @@ class TestSummaries:
         provider.model_name = "test-model"
         provider.version = "1"
         provider.prompt_version = "1"
-        provider.summarize.return_value = "A test summary."
+        provider.summarize_many.side_effect = (
+            lambda texts, metadata: ["A test summary." for _ in texts]
+        )
 
         manager._summary_provider = provider
         (tmp_path / "mod.py").write_text("def foo(): pass\n")
@@ -166,7 +230,7 @@ class TestSummaries:
             assert len(rows) >= 1
         finally:
             db.close()
-        provider.summarize.assert_called()
+        provider.summarize_many.assert_called()
 
     def test_no_summary_when_provider_none(self, manager, tmp_path):
         (tmp_path / "mod.py").write_text("x = 1\n")
@@ -174,6 +238,45 @@ class TestSummaries:
 
         assert result["summaries_recomputed"] == 0
         assert result["summaries_reused"] == 0
+
+    def test_summary_provider_called_once_for_all_entities(self, manager, tmp_path):
+        provider = MagicMock()
+        provider.provider_name = "test"
+        provider.model_name = "test-model"
+        provider.version = "1"
+        provider.prompt_version = "1"
+        provider.summarize_many.side_effect = (
+            lambda texts, metadata: ["summary" for _ in texts]
+        )
+
+        manager._summary_provider = provider
+        (tmp_path / "mod.py").write_text(
+            "def alpha(): pass\n\ndef beta(): pass\n\ndef gamma(): pass\n"
+        )
+        manager.index_project(tmp_path, force=True)
+
+        assert provider.summarize_many.call_count == 1
+        assert len(provider.summarize_many.call_args.args[0]) >= 4
+
+    def test_summary_provider_failure_does_not_rollback_index(self, manager, tmp_path):
+        provider = MagicMock()
+        provider.provider_name = "test"
+        provider.model_name = "test-model"
+        provider.version = "1"
+        provider.prompt_version = "1"
+        provider.summarize_many.side_effect = RuntimeError("summary provider unavailable")
+
+        manager._summary_provider = provider
+        (tmp_path / "mod.py").write_text("def foo(): pass\n")
+        result = manager.index_project(tmp_path, force=True)
+
+        assert result["entities_recomputed"] >= 1
+        assert result["summaries_recomputed"] == 0
+        db = manager.open_database(tmp_path)
+        try:
+            assert db.execute("SELECT count(*) FROM entities").fetchone()[0] >= 1
+        finally:
+            db.close()
 
 
 # ── Match Reason ──────────────────────────────────────────────────────────
@@ -426,7 +529,7 @@ class TestProjectPathGuardWiring:
 
 
 class TestCacheManagerWiring:
-    def test_cache_metadata_written_during_indexing(self, manager, tmp_path):
+    def test_cache_metadata_not_written_during_indexing(self, manager, tmp_path):
         (tmp_path / "mod.py").write_text("def foo(): pass\n")
         manager.index_project(tmp_path, force=True)
 
@@ -435,21 +538,21 @@ class TestCacheManagerWiring:
             rows = db.execute(
                 "SELECT * FROM cache_metadata WHERE cache_layer = 'entity'"
             ).fetchall()
-            assert len(rows) >= 1
+            assert rows == []
         finally:
             db.close()
 
-    def test_cache_metadata_has_correct_project(self, manager, tmp_path):
+    def test_cache_metadata_stays_empty_during_indexing(self, manager, tmp_path):
         (tmp_path / "mod.py").write_text("def foo(): pass\n")
         result = manager.index_project(tmp_path, force=True)
-        project_id = result.get("project_id")
+        assert result.get("project_id")
 
         db = manager.open_database(tmp_path)
         try:
             row = db.execute(
                 "SELECT project_id FROM cache_metadata LIMIT 1"
             ).fetchone()
-            assert row["project_id"] == project_id
+            assert row is None
         finally:
             db.close()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+import textwrap
 from collections.abc import Iterable
 from typing import Any
 
@@ -58,6 +59,20 @@ def _normalize_fallback(source: str) -> str:
 
 def semantic_hash_python(source: str) -> str:
     return sha256_text(normalize_python_source(source))
+
+
+def semantic_hash_ast(node: ast.AST, source: str) -> str:
+    """Hash an already-parsed AST node, falling back to normalized source."""
+    try:
+        normalized = ast.dump(
+            node,
+            annotate_fields=True,
+            include_attributes=False,
+        )
+    except Exception:
+        normalized = _normalize_fallback(textwrap.dedent(source))
+
+    return sha256_text(normalized)
 
 
 def semantic_hash(source: str) -> str:

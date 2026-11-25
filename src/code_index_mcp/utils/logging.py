@@ -18,8 +18,15 @@ _RESET = "\033[0m"
 class ColorFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         color = _LEVEL_COLORS.get(record.levelno, "")
-        record.levelname = f"{color}{record.levelname}{_RESET}"
-        return super().format(record)
+        if not color:
+            return super().format(record)
+
+        original = record.levelname
+        try:
+            record.levelname = f"{color}{original}{_RESET}"
+            return super().format(record)
+        finally:
+            record.levelname = original
 
 
 def configure_logging(

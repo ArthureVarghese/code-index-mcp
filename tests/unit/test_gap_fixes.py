@@ -83,13 +83,32 @@ class TestAtomicTransactions:
         pm.index_project(tmp_path)
         db.transaction.assert_called()
 
+    def test_indexing_uses_one_transaction_with_savepoints(self, tmp_path):
+        db = MagicMock()
+        repos = MagicMock()
+        repos.get_file.return_value = None
+        repos.get_entities_for_file.return_value = []
+        repos.list_entities.return_value = []
+        db.execute.return_value.fetchone.return_value = {"project_id": "proj"}
+        repos.upsert_entities.side_effect = [None, RuntimeError("db fail")]
+
+        pm = IndexManager(db, PythonAnalyzer(), MarkdownAnalyzer(), repos)
+        (tmp_path / "a.py").write_text("x = 1\n")
+        (tmp_path / "b.py").write_text("y = 2\n")
+
+        result = pm.index_project(tmp_path)
+
+        db.transaction.assert_called_once()
+        assert db.savepoint.call_count == 2
+        assert len(result["errors"]) == 1
+
     def test_transaction_rollback_on_error(self, tmp_path):
         db = MagicMock()
         repos = MagicMock()
         repos.get_file.return_value = None
         repos.get_entities_for_file.return_value = []
         db.execute.return_value.fetchone.return_value = {"project_id": "proj"}
-        repos.upsert_entity.side_effect = RuntimeError("db fail")
+        repos.upsert_entities.side_effect = RuntimeError("db fail")
 
         pm = IndexManager(db, PythonAnalyzer(), MarkdownAnalyzer(), repos)
         (tmp_path / "a.py").write_text("def foo(): pass\n")

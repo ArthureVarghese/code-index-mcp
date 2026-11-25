@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from code_index_mcp.config import IndexConfig
@@ -61,6 +63,22 @@ class TestIgnoreMatcher:
         # Should not raise
         matcher = IgnoreMatcher(tmp_path, config)
         assert not matcher.is_ignored(tmp_path / "test.py")
+
+    def test_ordinary_file_is_not_resolved(self, tmp_path, monkeypatch):
+        (tmp_path / "code.py").write_text("x = 1\n")
+        matcher = IgnoreMatcher(tmp_path, IndexConfig())
+
+        def fail_resolve(_self):
+            raise AssertionError("Path.resolve should not be called for ordinary files")
+
+        monkeypatch.setattr(Path, "resolve", fail_resolve)
+        assert matcher.is_ignored(tmp_path / "code.py") is False
+
+    def test_is_ignored_dir(self, tmp_path):
+        config = IndexConfig()
+        matcher = IgnoreMatcher(tmp_path, config)
+        assert matcher.is_ignored_dir(tmp_path / ".venv")
+        assert matcher.is_ignored_dir(tmp_path / "src") is False
 
 
 class TestProjectPathGuard:

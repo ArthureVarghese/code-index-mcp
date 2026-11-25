@@ -99,5 +99,9 @@ class TestNameOf:
         from unittest.mock import patch
         target = "code_index_mcp.indexing.python.relationships.ast.unparse"
         with patch(target, side_effect=Exception):
-            node = ast.Name(id="foo", ctx=ast.Load())
+            node = ast.Subscript(
+                value=ast.Name(id="foo", ctx=ast.Load()),
+                slice=ast.Constant(value=0),
+                ctx=ast.Load(),
+            )
             assert _name_of(node) is None

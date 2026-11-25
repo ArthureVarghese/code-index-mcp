@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from code_index_mcp.embeddings.cache import EmbeddingCache
+from code_index_mcp.embeddings.cache import EmbeddingCache, embedding_cache_key
 from code_index_mcp.embeddings.provider import EmbeddingProvider
 
 
@@ -54,6 +54,31 @@ class TestEmbeddingCache:
         result = cache.get_or_create("hash1", "hello")
         assert result == [99.0]
         repos.store_embedding.assert_not_called()
+
+    def test_prepare_many_batches_misses_and_reports_counts(self):
+        key1 = embedding_cache_key("h1", "test", "test-model", "1")
+        repos = MagicMock()
+        repos.get_embeddings_by_cache_keys.return_value = {key1: [9.0]}
+        provider = MagicMock(
+            provider_name="test", model_name="test-model", version="1"
+        )
+        provider.embed.return_value = [[2.0], [3.0]]
+        cache = EmbeddingCache(repos, provider)
+
+        vectors, entries, reused, recomputed = cache.prepare_many(
+            [("h1", "first", "e1"), ("h2", "second", "e2"), ("h3", "third", "e3")]
+        )
+
+        assert vectors == [[9.0], [2.0], [3.0]]
+        assert len(entries) == 2
+        assert (reused, recomputed) == (1, 2)
+        provider.embed.assert_called_once_with(["second", "third"])
+        repos.store_embeddings.assert_not_called()
+
+    def test_cache_key_includes_version(self):
+        assert embedding_cache_key("h", "p", "m", "1") != embedding_cache_key(
+            "h", "p", "m", "2"
+        )
 
 
 class TestEmbeddingProviderAbstract:

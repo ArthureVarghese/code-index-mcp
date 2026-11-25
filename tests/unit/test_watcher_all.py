@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from code_index_mcp.config import IndexConfig
+from code_index_mcp.security.ignore import IgnoreMatcher
 from code_index_mcp.watcher.debounce import Debouncer
 from code_index_mcp.watcher.service import FileWatcher
 
@@ -157,3 +159,21 @@ class TestTakeSnapshot:
             snapshot = watcher._take_snapshot()
         # The file should be skipped due to permission error
         assert "a.py" not in snapshot
+
+    def test_prunes_ignored_directories(self, tmp_path):
+        config = IndexConfig()
+        (tmp_path / ".venv").mkdir()
+        (tmp_path / ".venv" / "code.py").write_text("x = 1\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "code.py").write_text("x = 2\n")
+
+        watcher = FileWatcher(
+            tmp_path,
+            MagicMock(),
+            ignore=IgnoreMatcher(tmp_path, config),
+            excluded_directories=config.excluded_directories,
+        )
+
+        snapshot = watcher._take_snapshot()
+        assert ".venv/code.py" not in snapshot
+        assert "src/code.py" in snapshot

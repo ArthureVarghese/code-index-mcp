@@ -29,6 +29,7 @@ class Database:
         )
 
         self._connection.row_factory = sqlite3.Row
+        self._savepoint_counter = 0
 
         self._configure()
         self.initialize()
@@ -162,6 +163,22 @@ class Database:
             raise
         else:
             self._connection.commit()
+
+    @contextmanager
+    def savepoint(self) -> Iterator[sqlite3.Connection]:
+        """Run a nested unit of work inside the active transaction."""
+        self._savepoint_counter += 1
+        name = f"code_index_sp_{self._savepoint_counter}"
+        self._connection.execute(f"SAVEPOINT {name}")
+
+        try:
+            yield self._connection
+        except Exception:
+            self._connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            self._connection.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+        else:
+            self._connection.execute(f"RELEASE SAVEPOINT {name}")
 
     def execute(
         self,

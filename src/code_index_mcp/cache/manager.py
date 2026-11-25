@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 class CacheManager:
     """Persistence for independently invalidatable derived cache layers."""
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(self, connection: Connection, *, enabled: bool = True) -> None:
         self.connection = connection
+        self.enabled = enabled
 
     def get(
         self,
@@ -66,6 +67,9 @@ class CacheManager:
         implementation_version: str,
         value: Any,
     ) -> None:
+        if not self.enabled:
+            return
+
         self.connection.execute(
             """
             INSERT INTO cache_metadata (

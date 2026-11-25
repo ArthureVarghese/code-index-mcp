@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-
-from ..config import DEFAULT_EXTENSIONS
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +21,17 @@ class FileWatcher:
         *,
         debounce_seconds: float = 0.25,
         interval_seconds: float = 0.1,
+        ignore: Any | None = None,
+        extensions: frozenset[str] | None = None,
+        excluded_directories: frozenset[str] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.callback = callback
         self.debounce_seconds = max(0.0, debounce_seconds)
         self.interval_seconds = max(0.01, interval_seconds)
+        self.ignore = ignore
+        self.extensions = extensions or frozenset({".py", ".pyi", ".md", ".markdown"})
+        self.excluded_directories = excluded_directories or frozenset()
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -92,23 +98,45 @@ class FileWatcher:
         if not self.root.exists():
             return snapshot
 
-        for path in self.root.rglob("*"):
+        def walk(directory: Path) -> None:
             try:
-                if not path.is_file() or path.is_symlink():
+                entries = list(os.scandir(directory))
+            except OSError:
+                return
+
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+
+                    path = Path(entry.path)
+
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in self.excluded_directories:
+                            continue
+                        if self.ignore and self.ignore.is_ignored_dir(path):
+                            continue
+                        walk(path)
+                        continue
+
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+
+                    if path.suffix.lower() not in self.extensions:
+                        continue
+
+                    if self.ignore and self.ignore.is_ignored(path):
+                        continue
+
+                    stat = path.stat()
+                    snapshot[path.relative_to(self.root).as_posix()] = (
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+                except OSError:
                     continue
 
-                if path.suffix.lower() not in DEFAULT_EXTENSIONS:
-                    continue
-
-                stat = path.stat()
-
-                snapshot[path.relative_to(self.root).as_posix()] = (
-                    stat.st_mtime_ns,
-                    stat.st_size,
-                )
-            except (FileNotFoundError, PermissionError, OSError):
-                continue
-
+        walk(self.root)
         return snapshot
 
     def __enter__(self) -> FileWatcher:

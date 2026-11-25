@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from code_index_mcp.indexing.python.analyzer import PythonAnalyzer
 from code_index_mcp.search.engine import SearchEngine
 from code_index_mcp.search.fts import FTSSearch
 from code_index_mcp.search.ranking import SearchRanker
 from code_index_mcp.search.semantic import SemanticSearch
 from code_index_mcp.search.symbols import SymbolSearch
+from code_index_mcp.storage.database import Database
+from code_index_mcp.storage.repositories import RepositoryStore
 
 
 class TestFTSSearch:
@@ -216,8 +219,9 @@ class TestSearchEngineBatch:
 
     def test_search_many_merges_different_entities(self):
         repos = MagicMock()
-        repos.search_symbols.side_effect = lambda q, **kw: [
-            {"entity_id": f"e:{q}", "name": q, "score": 1.0}
+        repos.search_symbols.return_value = [
+            {"entity_id": "e:foo", "name": "foo", "score": 1.0},
+            {"entity_id": "e:baz", "name": "baz", "score": 1.0},
         ]
         repos.search_text.return_value = []
         engine = SearchEngine(repos)
@@ -245,6 +249,23 @@ class TestSearchEngineBatch:
         results = engine.search_many(["a", "b"], limit=2)
         assert len(results) <= 2
 
+    def test_search_many_runs_one_pipeline_pass(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = []
+        repos.search_text.return_value = []
+        repos.search_headings.return_value = []
+        engine = SearchEngine(repos)
+        engine.search_many(["auth", "token", "scope", "user"], path="src/auth.py")
+        repos.search_symbols.assert_called_once_with(
+            "auth token scope user",
+            kind="all",
+            limit=10,
+            path="src/auth.py",
+            tokens=["auth", "token", "scope", "user"],
+        )
+        repos.search_text.assert_called_once()
+        repos.search_headings.assert_called_once()
+
     def test_search_many_forwards_path(self):
         repos = MagicMock()
         repos.search_symbols.return_value = []
@@ -252,9 +273,77 @@ class TestSearchEngineBatch:
         repos.search_headings.return_value = []
         engine = SearchEngine(repos)
         engine.search_many(["auth", "token"], path="src/auth.py")
-        repos.search_symbols.assert_any_call(
-            "auth", kind="all", limit=10, path="src/auth.py"
+        repos.search_symbols.assert_called_once_with(
+            "auth token",
+            kind="all",
+            limit=10,
+            path="src/auth.py",
+            tokens=["auth", "token"],
         )
-        repos.search_symbols.assert_any_call(
-            "token", kind="all", limit=10, path="src/auth.py"
-        )
+
+    def test_search_many_attributes_tokens_from_their_source(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = [
+            {"entity_id": "e1", "name": "foo", "score": 1.0}
+        ]
+        repos.search_text.return_value = [
+            {"entity_id": "e2", "name": "other", "text": "only bar here", "score": 1.0}
+        ]
+        engine = SearchEngine(repos)
+
+        results = {r["entity_id"]: r for r in engine.search_many(["foo", "bar"])}
+
+        assert results["e1"]["keywords"] == ["foo"]
+        assert results["e2"]["keywords"] == ["bar"]
+
+    def test_semantic_path_filter_removes_prefix_only(self):
+        repos = MagicMock()
+        repos.search_symbols.return_value = []
+        repos.search_text.return_value = []
+        engine = SearchEngine(repos)
+        engine.semantic = MagicMock()
+        engine.semantic.enabled = True
+        engine.semantic.search.return_value = [
+            {"entity_id": "e1", "path": "file:error.py", "name": "x", "score": 1.0}
+        ]
+
+        results = engine.search("x", path="error.py")
+
+        assert [r["entity_id"] for r in results] == ["e1"]
+
+
+class TestSearchDocumentBatching:
+    def test_unchanged_search_documents_skip_fts_rewrite(self, tmp_path):
+        db = Database(tmp_path / "fts.db")
+        try:
+            db.execute(
+                """
+                INSERT INTO projects (
+                    project_id, canonical_root, schema_version,
+                    indexer_version, indexing_state, configuration_fingerprint
+                ) VALUES ('p', ?, 1, 'test', 'ready', '')
+                """,
+                (str(tmp_path),),
+            )
+            repos = RepositoryStore(db.connection)
+            repos.set_project_id("p")
+            analyzed = PythonAnalyzer().analyze(
+                "def foo():\n    return 1\n",
+                "a.py",
+                project_id="p",
+                file_id="file:a.py",
+            )
+
+            repos.upsert_entities(analyzed.entities)
+
+            statements: list[str] = []
+            db.connection.set_trace_callback(statements.append)
+            try:
+                repos.upsert_entities(analyzed.entities)
+            finally:
+                db.connection.set_trace_callback(None)
+
+            assert not any("search_fts" in statement for statement in statements)
+            db.execute("INSERT INTO search_fts(search_fts) VALUES('integrity-check')")
+        finally:
+            db.close()

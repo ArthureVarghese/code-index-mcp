@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from code_index_mcp.storage.database import Database
 
 
@@ -39,6 +41,26 @@ class TestDatabaseExtended:
                 db.connection.execute("INSERT INTO t VALUES (1)")
             rows = db.execute("SELECT * FROM t").fetchall()
             assert len(rows) == 1
+        finally:
+            db.close()
+
+    def test_savepoint_rollback_isolation(self, tmp_path):
+        db = Database(tmp_path / "savepoint.db")
+        try:
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+            with db.transaction():
+                db.execute("INSERT INTO t VALUES (1)")
+
+                with pytest.raises(RuntimeError):
+                    with db.savepoint():
+                        db.execute("INSERT INTO t VALUES (2)")
+                        raise RuntimeError("force savepoint rollback")
+
+                db.execute("INSERT INTO t VALUES (3)")
+
+            rows = db.execute("SELECT id FROM t ORDER BY id").fetchall()
+            assert [row["id"] for row in rows] == [1, 3]
         finally:
             db.close()
 

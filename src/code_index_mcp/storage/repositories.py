@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from sqlite3 import Connection
+from typing import Any
 
 from ..models.entities import (
     Entity,
@@ -27,6 +29,44 @@ def utc_now() -> str:
 
 def _file_id(relative_path: str) -> str:
     return f"file:{relative_path}"
+
+
+def _row_to_entity(row: Any) -> Entity:
+    return Entity(
+        entity_id=row["entity_id"],
+        project_id=row["project_id"],
+        file_id=row["file_id"],
+        source_kind=SourceKind(row["source_kind"]),
+        entity_type=EntityType(row["entity_type"]),
+        name=row["name"],
+        qualified_name=row["qualified_name"],
+        parent_id=row["parent_id"],
+        source_range=SourceRange(
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            start_column=row["start_column"],
+            end_column=row["end_column"],
+        ),
+        content_hash=row["content_hash"],
+        exact_source_hash=row["exact_source_hash"],
+        semantic_hash=row["semantic_hash"],
+        structural_hash=row["structural_hash"],
+        source=row["source"],
+        docstring=row["docstring"],
+        signature=row["signature"],
+        decorators=tuple(json.loads(row["decorators_json"])),
+        metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def _entity_result(entity: Entity) -> dict:
+    return {
+        **entity.to_dict(),
+        "path": entity.file_id,
+        "entity_type": entity.entity_type.value,
+        "start_line": entity.source_range.start_line,
+        "end_line": entity.source_range.end_line,
+    }
 
 
 class ProjectRepository:
@@ -226,6 +266,91 @@ class EntityRepository:
             ),
         )
 
+    def upsert_many(self, entities: list[Entity]) -> None:
+        if not entities:
+            return
+
+        self.connection.executemany(
+            """
+            INSERT INTO entities (
+                entity_id,
+                project_id,
+                file_id,
+                source_kind,
+                entity_type,
+                name,
+                qualified_name,
+                parent_id,
+                start_line,
+                end_line,
+                start_column,
+                end_column,
+                content_hash,
+                exact_source_hash,
+                semantic_hash,
+                structural_hash,
+                source,
+                docstring,
+                signature,
+                decorators_json,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(entity_id) DO UPDATE SET
+                file_id = excluded.file_id,
+                source_kind = excluded.source_kind,
+                entity_type = excluded.entity_type,
+                name = excluded.name,
+                qualified_name = excluded.qualified_name,
+                parent_id = excluded.parent_id,
+                start_line = excluded.start_line,
+                end_line = excluded.end_line,
+                start_column = excluded.start_column,
+                end_column = excluded.end_column,
+                content_hash = excluded.content_hash,
+                exact_source_hash = excluded.exact_source_hash,
+                semantic_hash = excluded.semantic_hash,
+                structural_hash = excluded.structural_hash,
+                source = excluded.source,
+                docstring = excluded.docstring,
+                signature = excluded.signature,
+                decorators_json = excluded.decorators_json,
+                metadata_json = excluded.metadata_json
+            """,
+            [
+                (
+                    entity.entity_id,
+                    entity.project_id,
+                    entity.file_id,
+                    entity.source_kind.value,
+                    entity.entity_type.value,
+                    entity.name,
+                    entity.qualified_name,
+                    entity.parent_id,
+                    entity.source_range.start_line,
+                    entity.source_range.end_line,
+                    entity.source_range.start_column,
+                    entity.source_range.end_column,
+                    entity.content_hash,
+                    entity.exact_source_hash,
+                    entity.semantic_hash,
+                    entity.structural_hash,
+                    entity.source,
+                    entity.docstring,
+                    entity.signature,
+                    json.dumps(entity.decorators),
+                    json.dumps(entity.metadata, sort_keys=True),
+                )
+                for entity in entities
+            ],
+        )
+
+    def update_structural_hash(self, entity_id: str, structural_hash: str) -> None:
+        self.connection.execute(
+            "UPDATE entities SET structural_hash = ? WHERE entity_id = ?",
+            (structural_hash, entity_id),
+        )
+
     def get(self, entity_id: str) -> Entity | None:
         row = self.connection.execute(
             """
@@ -239,36 +364,12 @@ class EntityRepository:
         if row is None:
             return None
 
-        return Entity(
-            entity_id=row["entity_id"],
-            project_id=row["project_id"],
-            file_id=row["file_id"],
-            source_kind=SourceKind(row["source_kind"]),
-            entity_type=EntityType(row["entity_type"]),
-            name=row["name"],
-            qualified_name=row["qualified_name"],
-            parent_id=row["parent_id"],
-            source_range=SourceRange(
-                start_line=row["start_line"],
-                end_line=row["end_line"],
-                start_column=row["start_column"],
-                end_column=row["end_column"],
-            ),
-            content_hash=row["content_hash"],
-            exact_source_hash=row["exact_source_hash"],
-            semantic_hash=row["semantic_hash"],
-            structural_hash=row["structural_hash"],
-            source=row["source"],
-            docstring=row["docstring"],
-            signature=row["signature"],
-            decorators=tuple(json.loads(row["decorators_json"])),
-            metadata=json.loads(row["metadata_json"]),
-        )
+        return _row_to_entity(row)
 
     def list_for_file(self, file_id: str) -> list[Entity]:
         rows = self.connection.execute(
             """
-            SELECT entity_id
+            SELECT *
             FROM entities
             WHERE file_id = ?
             ORDER BY start_line, start_column, end_line
@@ -276,13 +377,13 @@ class EntityRepository:
             (file_id,),
         ).fetchall()
 
-        return [entity for row in rows if (entity := self.get(row["entity_id"])) is not None]
+        return [_row_to_entity(row) for row in rows]
 
     def list_all(self) -> list[Entity]:
         rows = self.connection.execute(
-            "SELECT entity_id FROM entities ORDER BY file_id, start_line"
+            "SELECT * FROM entities ORDER BY file_id, start_line"
         ).fetchall()
-        return [entity for row in rows if (entity := self.get(row["entity_id"])) is not None]
+        return [_row_to_entity(row) for row in rows]
 
     def delete(self, entity_id: str) -> None:
         logger.debug("EntityRepository :: delete :: entity_id=%s", entity_id)
@@ -329,6 +430,43 @@ class RelationshipRepository:
                 relationship.confidence.value,
                 json.dumps(relationship.metadata, sort_keys=True),
             ),
+        )
+
+    def upsert_many(self, relationships: list[Relationship]) -> None:
+        if not relationships:
+            return
+
+        self.connection.executemany(
+            """
+            INSERT INTO relationships (
+                relationship_id,
+                project_id,
+                source_entity_id,
+                target_entity_id,
+                relationship_kind,
+                confidence,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(relationship_id) DO UPDATE SET
+                source_entity_id = excluded.source_entity_id,
+                target_entity_id = excluded.target_entity_id,
+                relationship_kind = excluded.relationship_kind,
+                confidence = excluded.confidence,
+                metadata_json = excluded.metadata_json
+            """,
+            [
+                (
+                    relationship.relationship_id,
+                    relationship.project_id,
+                    relationship.source_entity_id,
+                    relationship.target_entity_id,
+                    relationship.kind.value,
+                    relationship.confidence.value,
+                    json.dumps(relationship.metadata, sort_keys=True),
+                )
+                for relationship in relationships
+            ],
         )
 
     def delete_for_entity(self, entity_id: str) -> None:
@@ -441,6 +579,10 @@ class MarkdownSectionRepository:
         return [dict(r) for r in rows]
 
 
+EmbeddingCacheEntry = tuple[str, str, str, str, str, str, str, str, str]
+SummaryCacheEntry = tuple[str, str, str, str, str, str, str, str, str, str]
+
+
 class RepositoryStore:
     """Small repository facade used by the indexing/search/retrieval layers."""
 
@@ -451,16 +593,29 @@ class RepositoryStore:
         self.relationships = RelationshipRepository(connection)
         self.markdown_sections = MarkdownSectionRepository(connection)
         self._current_project_id = ""
+        self._project_id_cache: str | None = None
 
     def set_project_id(self, project_id: str) -> None:
         self._current_project_id = project_id
+        self._project_id_cache = None
 
     # Compatibility helpers used by IndexManager.
     def get_file(self, relative_path: str) -> dict | None:
+        where = "relative_path = ?"
+        params: list[Any] = [relative_path]
+        if self._current_project_id:
+            where += " AND project_id = ?"
+            params.append(self._current_project_id)
+
         row = self.connection.execute(
-            "SELECT * FROM files WHERE relative_path = ? LIMIT 1", (relative_path,)
+            f"SELECT * FROM files WHERE {where} LIMIT 1", params
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+
+        result = dict(row)
+        result.setdefault("content_hash", result.get("exact_hash"))
+        return result
 
     def upsert_file(self, relative_path: str, content_hash: str, entity_count: int) -> str:
         logger.debug("RepositoryStore :: upsert_file :: relative_path=%s", relative_path)
@@ -479,8 +634,16 @@ class RepositoryStore:
                 parser_version, parse_status, metadata_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?)
             ON CONFLICT(file_id) DO UPDATE SET
-                exact_hash=excluded.exact_hash, size_bytes=excluded.size_bytes,
-                mtime_ns=excluded.mtime_ns, parse_status='ok'
+                project_id=excluded.project_id,
+                canonical_path=excluded.canonical_path,
+                source_kind=excluded.source_kind,
+                exact_hash=excluded.exact_hash,
+                semantic_hash=excluded.semantic_hash,
+                size_bytes=excluded.size_bytes,
+                mtime_ns=excluded.mtime_ns,
+                parser_version=excluded.parser_version,
+                parse_status='ok',
+                metadata_json=excluded.metadata_json
             """,
             (file_id, project_id, relative_path, relative_path, source_kind,
              content_hash, content_hash, 0, 0, "utf-8", "0.1.0",
@@ -489,10 +652,23 @@ class RepositoryStore:
         return file_id
 
     def get_entities_for_file(self, relative_path: str) -> list[Entity]:
-        row = self.connection.execute(
-            "SELECT file_id FROM files WHERE relative_path = ? LIMIT 1", (relative_path,)
-        ).fetchone()
-        return self.entities.list_for_file(row["file_id"]) if row else []
+        where = "f.relative_path = ?"
+        params: list[Any] = [relative_path]
+        if self._current_project_id:
+            where += " AND f.project_id = ?"
+            params.append(self._current_project_id)
+
+        rows = self.connection.execute(
+            f"""
+            SELECT e.*
+            FROM entities e
+            JOIN files f ON f.file_id = e.file_id
+            WHERE {where}
+            ORDER BY e.start_line, e.start_column, e.end_line
+            """,
+            params,
+        ).fetchall()
+        return [_row_to_entity(row) for row in rows]
 
     def upsert_entity(self, entity: Entity) -> None:
         logger.debug("RepositoryStore :: upsert_entity :: entity_id=%s", entity.entity_id)
@@ -511,6 +687,32 @@ class RepositoryStore:
         self.entities.upsert(entity)
         self._upsert_search_document(entity)
 
+    def upsert_entities(self, entities: list[Entity]) -> None:
+        if not entities:
+            return
+
+        self.connection.executemany(
+            """
+            INSERT OR IGNORE INTO files(
+                file_id, project_id, relative_path, canonical_path, source_kind,
+                exact_hash, semantic_hash, size_bytes, mtime_ns, encoding, parser_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'utf-8', '0.1.0')
+            """,
+            [
+                (entity.file_id, entity.project_id,
+                 entity.file_id, entity.file_id, entity.source_kind.value,
+                 entity.exact_source_hash, entity.semantic_hash)
+                for entity in entities
+            ],
+        )
+        self.entities.upsert_many(entities)
+
+        for entity in entities:
+            self._upsert_search_document(entity)
+
+    def update_structural_hash(self, entity_id: str, structural_hash: str) -> None:
+        self.entities.update_structural_hash(entity_id, structural_hash)
+
     def delete_entity(self, entity_id: str) -> None:
         logger.debug("RepositoryStore :: delete_entity :: entity_id=%s", entity_id)
         row = self.connection.execute(
@@ -526,6 +728,26 @@ class RepositoryStore:
         keywords = " ".join(entity.metadata.get("keywords", []))
         parts = [entity.name, entity.qualified_name, entity.docstring or "", entity.source]
         content = "\n".join(filter(None, parts))
+        metadata_json = json.dumps(entity.metadata, sort_keys=True)
+
+        existing = self.connection.execute(
+            """
+            SELECT title, path, content, keywords, metadata_json
+            FROM search_documents
+            WHERE document_id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+
+        if existing is not None and (
+            existing["title"],
+            existing["path"],
+            existing["content"],
+            existing["keywords"],
+            existing["metadata_json"],
+        ) == (entity.name, path, content, keywords, metadata_json):
+            return
+
         self.connection.execute(
             """
             INSERT INTO search_documents(
@@ -539,8 +761,7 @@ class RepositoryStore:
                 keywords=excluded.keywords, metadata_json=excluded.metadata_json
             """,
             (document_id, entity.project_id, entity.entity_id, entity.source_kind.value,
-             entity.name, path, content, keywords,
-             json.dumps(entity.metadata, sort_keys=True)),
+             entity.name, path, content, keywords, metadata_json),
         )
         self.connection.execute("DELETE FROM search_fts WHERE document_id = ?", (document_id,))
         self.connection.execute(
@@ -560,28 +781,47 @@ class RepositoryStore:
         )
 
     def search_symbols(
-        self, query: str, *, kind: str = "all", limit: int = 20, path: str | None = None
+        self,
+        query: str,
+        *,
+        kind: str = "all",
+        limit: int = 20,
+        path: str | None = None,
+        tokens: list[str] | None = None,
     ) -> list[dict]:
-        q = query.strip().lower()
         where = ""
-        params: list = []
+        where_params: list = []
         if kind == "python":
             where = " AND f.source_kind = 'python'"
         elif kind == "markdown":
             where = " AND f.source_kind = 'markdown'"
         if path:
             where += " AND f.relative_path = ?"
-            params.append(path)
+            where_params.append(path)
+
+        filters: list[str] = []
+        filter_params: list = []
+        q = query.strip().lower()
+        if tokens:
+            for token in tokens:
+                filters.append("(lower(e.name) LIKE ? OR lower(e.qualified_name) LIKE ?)")
+                filter_params.extend([f"%{token.lower()}%", f"%{token.lower()}%"])
+        else:
+            filters.append("(lower(e.name) LIKE ? OR lower(e.qualified_name) LIKE ?)")
+            filter_params.extend([f"%{q}%", f"%{q}%"])
+
+        exact = tokens or [q]
+        exact_placeholders = ", ".join("?" for _ in exact)
         rows = self.connection.execute(
             f"""
             SELECT e.entity_id, f.relative_path AS path, e.entity_type AS kind,
                    e.name, e.qualified_name, e.start_line, e.end_line, e.source
             FROM entities e JOIN files f ON f.file_id=e.file_id
-            WHERE (lower(e.name) LIKE ? OR lower(e.qualified_name) LIKE ?){where}
-            ORDER BY CASE WHEN lower(e.name)=? THEN 0 ELSE 1 END, e.name
+            WHERE ({' OR '.join(filters)}){where}
+            ORDER BY CASE WHEN lower(e.name) IN ({exact_placeholders}) THEN 0 ELSE 1 END, e.name
             LIMIT ?
             """,
-            (f"%{q}%", f"%{q}%", *params, q, limit),
+            (*filter_params, *where_params, *(token.lower() for token in exact), limit),
         ).fetchall()
         return [
             {"entity_id": r["entity_id"], "path": r["path"], "kind": r["kind"],
@@ -592,7 +832,13 @@ class RepositoryStore:
         ]
 
     def search_text(
-        self, query: str, *, kind: str = "all", limit: int = 20, path: str | None = None
+        self,
+        query: str,
+        *,
+        kind: str = "all",
+        limit: int = 20,
+        path: str | None = None,
+        tokens: list[str] | None = None,
     ) -> list[dict]:
         where = "d.project_id = ?"
         params: list = [self._project_id()]
@@ -603,13 +849,24 @@ class RepositoryStore:
         if path:
             where += " AND f.path = ?"
             params.append(f"file:{path}")
-        # FTS5 MATCH syntax is deliberately constrained to safe tokens.
-        # Strip non-word characters (dots, parens, etc.) that break FTS5 syntax.
-        sanitized = re.sub(r"[^\w\s]", " ", query)
-        match = " ".join(sanitized.split())
+
+        def safe_token(value: str) -> str:
+            return " ".join(re.sub(r"[^\w\s]", " ", value).split())
+
+        if tokens:
+            safe_tokens = [safe_token(token) for token in tokens]
+            safe_tokens = [token for token in safe_tokens if token]
+            if not safe_tokens:
+                return []
+            match = " OR ".join(safe_tokens)
+        else:
+            match = safe_token(query)
+            if not match:
+                return []
+
         rows = self.connection.execute(
             f"""
-            SELECT f.document_id, f.title, f.path, f.content, d.source_kind,
+            SELECT d.entity_id, f.title, f.path, f.content, d.source_kind,
                    bm25(search_fts) AS score
             FROM search_fts f JOIN search_documents d ON d.document_id=f.document_id
             WHERE search_fts MATCH ? AND {where}
@@ -618,67 +875,66 @@ class RepositoryStore:
             """,
             (match, *params, limit),
         ).fetchall()
-        result = []
-        for r in rows:
-            doc = self.connection.execute(
-                "SELECT entity_id FROM search_documents WHERE document_id=?",
-                (r["document_id"],),
-            ).fetchone()
-            if not doc or not doc["entity_id"]:
-                continue
-            result.append({
-                "entity_id": doc["entity_id"],
+        return [
+            {
+                "entity_id": r["entity_id"],
                 "path": r["path"].removeprefix("file:"),
                 "kind": r["source_kind"],
-                "name": r["title"], "text": r["content"], "score": float(-r["score"]),
-            })
-        return result
+                "name": r["title"],
+                "text": r["content"],
+                "score": float(-r["score"]),
+            }
+            for r in rows
+            if r["entity_id"]
+        ]
 
     def search_headings(
-        self, query: str, *, limit: int = 20, path: str | None = None
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        path: str | None = None,
+        tokens: list[str] | None = None,
     ) -> list[dict]:
         """Search markdown sections by heading with hierarchy awareness.
 
         Matches heading text using LIKE, ordered by heading_level ascending
-        (more specific sections first). Falls back to FTS content match
-        if no heading matches found.
+        (more specific sections first).
         """
-        project_id = self._project_id()
-        tokens = [t for t in query.split() if t]
-        if not tokens:
+        search_tokens = tokens if tokens is not None else [t for t in query.split() if t]
+        if not search_tokens:
             return []
 
-        conditions = " AND ".join(["m.heading LIKE ?"] * len(tokens))
-        params: list[str] = [project_id] + [f"%{t}%" for t in tokens]
-        join = ""
+        if tokens is None:
+            conditions = " AND ".join(["m.heading LIKE ?"] * len(search_tokens))
+            params: list[str] = [f"%{t}%" for t in search_tokens]
+        else:
+            conditions = " OR ".join(["m.heading LIKE ?"] * len(search_tokens))
+            params = [f"%{t}%" for t in search_tokens]
+
+        where = f"m.project_id = ? AND ({conditions})"
+        full_params: list = [self._project_id(), *params]
         if path:
-            join = " JOIN files f ON f.file_id = m.file_id"
-            conditions += " AND f.relative_path = ?"
-            params.append(path)
-        params.append(limit)
+            where += " AND f.relative_path = ?"
+            full_params.append(path)
+        full_params.append(limit)
 
         rows = self.connection.execute(
             f"""
             SELECT m.section_id, m.heading, m.heading_level, m.heading_path,
-                   m.file_id, m.start_line, m.end_line
-            FROM markdown_sections m{join}
-            WHERE m.project_id = ? AND {conditions}
+                   f.relative_path AS relative_path, m.start_line, m.end_line
+            FROM markdown_sections m LEFT JOIN files f ON f.file_id = m.file_id
+            WHERE {where}
             ORDER BY m.heading_level ASC
             LIMIT ?
             """,
-            params,
+            full_params,
         ).fetchall()
 
-        results = []
-        for r in rows:
-            entity_id = r["section_id"]
-            file_path = self.connection.execute(
-                "SELECT relative_path FROM files WHERE file_id = ?",
-                (r["file_id"],),
-            ).fetchone()
-            results.append({
-                "entity_id": entity_id,
-                "path": file_path["relative_path"] if file_path else "",
+        return [
+            {
+                "entity_id": r["section_id"],
+                "path": r["relative_path"] or "",
                 "kind": "markdown",
                 "name": r["heading"],
                 "heading_level": r["heading_level"],
@@ -687,24 +943,22 @@ class RepositoryStore:
                 "end_line": r["end_line"],
                 "score": 1.0 + (1.0 / max(r["heading_level"], 1)),
                 "match_reason": "heading match",
-            })
-        return results
+            }
+            for r in rows
+        ]
 
     def _project_id(self) -> str:
+        if self._project_id_cache is not None:
+            return self._project_id_cache
         row = self.connection.execute("SELECT project_id FROM projects LIMIT 1").fetchone()
-        return row["project_id"] if row else ""
+        self._project_id_cache = row["project_id"] if row else ""
+        return self._project_id_cache
 
     def get_entity(self, entity_id: str) -> dict | None:
-        e = self.entities.get(entity_id)
-        if not e:
-            return None
-        return {
-            **e.to_dict(),
-            "path": e.file_id,
-            "entity_type": e.entity_type.value,
-            "start_line": e.start_line,
-            "end_line": e.end_line,
-        }
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE entity_id = ?", (entity_id,)
+        ).fetchone()
+        return _entity_result(_row_to_entity(row)) if row else None
 
     def get_parent(self, entity_id: str) -> dict | None:
         row = self.connection.execute(
@@ -714,18 +968,23 @@ class RepositoryStore:
 
     def get_children(self, entity_id: str) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT entity_id FROM entities WHERE parent_id=? ORDER BY start_line",
+            "SELECT * FROM entities WHERE parent_id=? ORDER BY start_line",
             (entity_id,),
         ).fetchall()
-        return [x for r in rows if (x := self.get_entity(r["entity_id"]))]
+        return [_entity_result(_row_to_entity(row)) for row in rows]
 
     def get_relationships(self, entity_id: str) -> list[dict]:
         return [r.to_dict() for r in self.relationships.find_for_entity(entity_id)]
 
     def get_file_region(self, path: str, start_line: int, end_line: int) -> dict:
         # First try reading from the indexed entity sources (cached in DB).
+        file_where = "relative_path = ?"
+        file_params: list[Any] = [path]
+        if self._current_project_id:
+            file_where += " AND project_id = ?"
+            file_params.append(self._current_project_id)
         file_row = self.connection.execute(
-            "SELECT file_id FROM files WHERE relative_path = ? LIMIT 1", (path,)
+            f"SELECT file_id FROM files WHERE {file_where} LIMIT 1", file_params
         ).fetchone()
         if file_row:
             entity_rows = self.connection.execute(
@@ -803,15 +1062,75 @@ class RepositoryStore:
 
     def list_entities(self) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT entity_id FROM entities ORDER BY file_id,start_line"
+            "SELECT * FROM entities ORDER BY file_id,start_line"
         ).fetchall()
-        return [x for r in rows if (x := self.get_entity(r["entity_id"]))]
+        return [_entity_result(_row_to_entity(row)) for row in rows]
 
     def clear(self) -> None:
         with self.connection:
             for table in ("search_fts", "search_documents", "relationships",
                           "entity_versions", "entities", "files"):
                 self.connection.execute(f"DELETE FROM {table}")
+
+    @staticmethod
+    def _chunks(values: list[str], size: int = 500) -> Iterator[list[str]]:
+        for start in range(0, len(values), size):
+            yield values[start : start + size]
+
+    def get_embeddings_by_cache_keys(self, cache_keys: list[str]) -> dict[str, list[float]]:
+        result: dict[str, list[float]] = {}
+        for chunk in self._chunks(cache_keys):
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                "SELECT cache_key, vector_json FROM embeddings"
+                f" WHERE cache_key IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                result[row["cache_key"]] = json.loads(row["vector_json"])
+        return result
+
+    def store_embeddings(self, entries: list[EmbeddingCacheEntry]) -> None:
+        if not entries:
+            return
+        self.connection.executemany(
+            """INSERT INTO embeddings
+                (cache_key, project_id, document_id, semantic_hash,
+                 provider, model, representation_version, vector_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                vector_json=excluded.vector_json, document_id=excluded.document_id""",
+            entries,
+        )
+
+    def get_summaries_by_cache_keys(self, cache_keys: list[str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for chunk in self._chunks(cache_keys):
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"SELECT cache_key, summary FROM summaries WHERE cache_key IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                result[row["cache_key"]] = row["summary"]
+        return result
+
+    def store_summaries(self, entries: list[SummaryCacheEntry]) -> None:
+        if not entries:
+            return
+        self.connection.executemany(
+            """INSERT INTO summaries
+                (cache_key, project_id, document_id, semantic_hash,
+                 metadata_hash, provider, model, prompt_version, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                summary=excluded.summary, document_id=excluded.document_id""",
+            entries,
+        )
 
     def get_embedding(
         self, content_hash: str, provider: str, model: str, version: str
@@ -856,13 +1175,13 @@ class RepositoryStore:
         version: str,
         prompt_version: str,
     ) -> str | None:
+        cache_key = f"sum:{semantic_hash}:{provider}:{model}:{version}:{prompt_version}"
         row = self.connection.execute(
-            """SELECT summary FROM summaries
-               WHERE semantic_hash=? AND metadata_hash=?
-                 AND provider=? AND model=? AND prompt_version=?""",
-            (semantic_hash, metadata_hash, provider, model, prompt_version),
+            "SELECT summary FROM summaries WHERE cache_key=?",
+            (cache_key,),
         ).fetchone()
         return row["summary"] if row else None
+
 
     def store_summary(
         self,
@@ -876,7 +1195,7 @@ class RepositoryStore:
         *,
         document_id: str = "",
     ) -> None:
-        cache_key = f"sum:{semantic_hash}:{provider}:{model}:{prompt_version}"
+        cache_key = f"sum:{semantic_hash}:{provider}:{model}:{version}:{prompt_version}"
         project_id = self._current_project_id
         if not document_id:
             document_id = f"entity:{semantic_hash}"

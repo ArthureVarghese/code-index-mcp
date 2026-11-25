@@ -156,8 +156,8 @@ def create_server(config: IndexConfig | None = None) -> FastMCP:
         `start_line`/`end_line` — pass them to get_code to read only that slice.
 
         Set `keywords` to true to search several terms at once: the server splits
-        `query` into tokens, searches each independently, then combines and
-        deduplicates by entity_id, tagged with the keyword(s) each matched.
+        `query` into tokens, searches once with all tokens, then tags each
+        result with the keyword(s) it matched.
 
         Pass `path` (a relative file path, e.g. "src/app/state.py") to restrict
         the search to just that one Python file.
@@ -198,8 +198,8 @@ def create_server(config: IndexConfig | None = None) -> FastMCP:
         them to get_code or get_markdown_section to read only that part.
 
         Set `keywords` to true to search several terms at once: the server splits
-        `query` into tokens, searches each independently, then combines and
-        deduplicates by entity_id, tagged with the keyword(s) each matched.
+        `query` into tokens, searches once with all tokens, then tags each
+        result with the keyword(s) it matched.
 
         Pass `path` (a relative file path, e.g. "docs/cache.md") to restrict the
         search to just that one Markdown file.

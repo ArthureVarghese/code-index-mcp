@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_files_project
 CREATE INDEX IF NOT EXISTS idx_files_hash
     ON files(project_id, exact_hash);
 
+CREATE INDEX IF NOT EXISTS idx_files_relative_path
+    ON files(relative_path);
+
 CREATE TABLE IF NOT EXISTS entities (
     entity_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -91,6 +94,9 @@ CREATE INDEX IF NOT EXISTS idx_entities_qualified_name
 
 CREATE INDEX IF NOT EXISTS idx_entities_content_hash
     ON entities(project_id, content_hash);
+
+CREATE INDEX IF NOT EXISTS idx_entities_file_order
+    ON entities(file_id, start_line, start_column, end_line);
 
 CREATE TABLE IF NOT EXISTS entity_versions (
     entity_id TEXT NOT NULL,
@@ -161,6 +167,9 @@ CREATE INDEX IF NOT EXISTS idx_markdown_sections_file
 CREATE INDEX IF NOT EXISTS idx_markdown_sections_hash
     ON markdown_sections(project_id, content_hash);
 
+CREATE INDEX IF NOT EXISTS idx_markdown_sections_heading_path
+    ON markdown_sections(project_id, heading_path);
+
 CREATE TABLE IF NOT EXISTS search_documents (
     document_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -179,6 +188,12 @@ CREATE TABLE IF NOT EXISTS search_documents (
 
 CREATE INDEX IF NOT EXISTS idx_search_documents_project
     ON search_documents(project_id);
+
+CREATE INDEX IF NOT EXISTS idx_search_documents_entity
+    ON search_documents(entity_id);
+
+CREATE INDEX IF NOT EXISTS idx_search_documents_section
+    ON search_documents(section_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
     document_id UNINDEXED,
@@ -208,6 +223,9 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_embeddings_document
     ON embeddings(document_id);
 
+CREATE INDEX IF NOT EXISTS idx_embeddings_lookup
+    ON embeddings(semantic_hash, provider, model, representation_version);
+
 CREATE TABLE IF NOT EXISTS summaries (
     cache_key TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -226,6 +244,9 @@ CREATE TABLE IF NOT EXISTS summaries (
 
 CREATE INDEX IF NOT EXISTS idx_summaries_document
     ON summaries(document_id);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_lookup
+    ON summaries(semantic_hash, metadata_hash, provider, model, prompt_version);
 
 CREATE TABLE IF NOT EXISTS cache_metadata (
     cache_key TEXT PRIMARY KEY,

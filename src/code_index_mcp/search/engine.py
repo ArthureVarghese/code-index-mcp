@@ -32,35 +32,85 @@ class SearchEngine:
         limit: int = 10,
         path: str | None = None,
     ) -> list[dict[str, Any]]:
+        return self._search_once(query, kind=kind, limit=limit, path=path)
+
+    def search_many(
+        self,
+        keywords: list[str],
+        *,
+        kind: str = "all",
+        limit: int = 10,
+        path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one hybrid search with all keywords and tag each result."""
         logger.debug(
-            "SearchEngine :: search :: query=%s, kind=%s, limit=%s, path=%s",
-            query, kind, limit, path,
+            "SearchEngine :: search_many :: keywords=%s, kind=%s, limit=%s, path=%s",
+            keywords, kind, limit, path,
         )
-        symbol_results = self.symbols.search(
-            query,
+        queries = [k.strip() for k in keywords if k and k.strip()]
+        if not queries:
+            return []
+
+        combined = " ".join(queries)
+        ranked = self._search_once(
+            combined,
             kind=kind,
             limit=limit,
             path=path,
+            tokens=queries,
         )
 
+        results = []
+        for result in ranked:
+            entry = dict(result)
+            matched = self._matching_keywords(entry, queries)
+            entry["keywords"] = matched
+            entry["score"] = float(entry.get("score", 0)) + 2.0 * len(matched)
+            results.append(entry)
+
+        results.sort(key=lambda r: float(r.get("score", 0)), reverse=True)
+        logger.info(
+            "SearchEngine :: search_many :: keywords=%s returned %d results",
+            keywords, len(results),
+        )
+        return results[:limit]
+
+    def _search_once(
+        self,
+        query: str,
+        *,
+        kind: str,
+        limit: int,
+        path: str | None,
+        tokens: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        logger.debug(
+            "SearchEngine :: _search_once :: query=%s, kind=%s, limit=%s, path=%s",
+            query, kind, limit, path,
+        )
+        extra: dict[str, Any] = {}
+        if tokens is not None:
+            extra["tokens"] = tokens
+
+        symbol_results = self.symbols.search(
+            query, kind=kind, limit=limit, path=path, **extra
+        )
         text_results = self.fts.search(
-            query,
-            kind=kind,
-            limit=limit,
-            path=path,
+            query, kind=kind, limit=limit, path=path, **extra
         )
 
         heading_results: list[dict[str, Any]] = []
         if kind in ("all", "markdown"):
+            heading_extra = {"tokens": tokens} if tokens is not None else {}
             heading_results = self._repos.search_headings(
-                query, limit=limit, path=path
+                query, limit=limit, path=path, **heading_extra
             )
 
         semantic_results = self.semantic.search(query, limit=limit) if self.semantic.enabled else []
         if path and self.semantic.enabled:
             semantic_results = [
                 r for r in semantic_results
-                if r.get("path", "").lstrip("file:") == path
+                if r.get("path", "").removeprefix("file:") == path
             ]
 
         merged = self._merge(
@@ -71,57 +121,21 @@ class SearchEngine:
         )
 
         ranked = self.ranker.rank(query, merged)[:limit]
-        logger.info("SearchEngine :: search :: query=%s returned %d results", query, len(ranked))
+        logger.info(
+            "SearchEngine :: _search_once :: query=%s returned %d results",
+            query,
+            len(ranked),
+        )
         return ranked
 
-    def search_many(
-        self,
-        keywords: list[str],
-        *,
-        kind: str = "all",
-        limit: int = 10,
-        path: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Run several keyword searches and merge them into one deduplicated list.
-
-        Each keyword is searched independently using the full hybrid pipeline,
-        then results are merged across keywords keyed by ``entity_id``: scores
-        are summed (an entity matching multiple keywords ranks higher) and the
-        matching keyword(s) are accumulated onto the result as ``keywords``.
-        """
-        logger.debug(
-            "SearchEngine :: search_many :: keywords=%s, kind=%s, limit=%s, path=%s",
-            keywords, kind, limit, path,
+    @staticmethod
+    def _matching_keywords(result: dict[str, Any], queries: list[str]) -> list[str]:
+        haystack = " ".join(
+            str(result.get(field, "")).lower()
+            for field in ("name", "path", "qualified_name", "text", "heading_path")
         )
-        queries = [k.strip() for k in keywords if k and k.strip()]
-        if not queries:
-            return []
-
-        merged: dict[str, dict[str, Any]] = {}
-        for query in queries:
-            for result in self.search(query, kind=kind, limit=limit, path=path):
-                entity_id = result.get("entity_id")
-                if not entity_id:
-                    continue
-                if entity_id not in merged:
-                    entry = dict(result)
-                    entry["keywords"] = []
-                    merged[entity_id] = entry
-                entry = merged[entity_id]
-                entry["score"] = float(entry.get("score", 0)) + float(result.get("score", 0))
-                if query not in entry["keywords"]:
-                    entry["keywords"].append(query)
-
-        results = sorted(
-            merged.values(),
-            key=lambda r: float(r.get("score", 0)),
-            reverse=True,
-        )[:limit]
-        logger.info(
-            "SearchEngine :: search_many :: keywords=%s returned %d results",
-            keywords, len(results),
-        )
-        return results
+        matched = [query for query in queries if query.lower() in haystack]
+        return list(dict.fromkeys(matched))
 
     @staticmethod
     def _merge(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -66,7 +66,7 @@ class IndexConfig:
     watcher_debounce_ms: int = 500
     search_limit_default: int = 10
     search_limit_max: int = 100
-    dev_mode: bool = True
+    dev_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.max_file_size_bytes <= 0:
@@ -122,7 +122,7 @@ class IndexConfig:
         """Build configuration from environment variables."""
         logger.debug("from_environment :: loading config from environment variables")
 
-        dev_mode = _env_bool("CODE_INDEX_MCP_DEV", True)
+        dev_mode = _env_bool("CODE_INDEX_MCP_DEV", False)
 
         # Explicit index root takes precedence over dev mode default
         index_root_env = os.environ.get("CODE_INDEX_MCP_INDEX_ROOT")

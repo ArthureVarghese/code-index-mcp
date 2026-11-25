@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+from fnmatch import translate
 from pathlib import Path
 
 from ..config import IndexConfig
@@ -18,6 +21,34 @@ class IgnoreMatcher:
         self.root = root.resolve()
         self.config = config
         self.patterns = self._load_patterns()
+        self._compiled_patterns = [
+            re.compile(translate(os.path.normcase(pattern))) for pattern in self.patterns
+        ]
+
+    def _relative(self, path: Path) -> Path:
+        candidate = path.resolve() if path.is_symlink() else path
+        return candidate.relative_to(self.root)
+
+    def is_ignored_dir(self, path: Path) -> bool:
+        try:
+            relative = self._relative(path)
+        except ValueError:
+            return True
+
+        if any(part in self.config.excluded_directories for part in relative.parts):
+            logger.debug("IgnoreMatcher :: is_ignored_dir :: excluded directory: %s", path)
+            return True
+
+        normalized = os.path.normcase(relative.as_posix())
+        name = os.path.normcase(relative.name)
+        if any(
+            pattern.match(normalized) or pattern.match(name)
+            for pattern in self._compiled_patterns
+        ):
+            logger.debug("IgnoreMatcher :: is_ignored_dir :: matched pattern: %s", path)
+            return True
+
+        return False
 
     def _load_patterns(self) -> list[str]:
         patterns: list[str] = []
@@ -41,13 +72,11 @@ class IgnoreMatcher:
 
     def is_ignored(self, path: Path) -> bool:
         try:
-            relative = path.resolve().relative_to(self.root)
+            relative = self._relative(path)
         except ValueError:
             return True
 
-        parts = relative.parts
-
-        if any(part in self.config.excluded_directories for part in parts[:-1]):
+        if any(part in self.config.excluded_directories for part in relative.parts[:-1]):
             logger.debug("IgnoreMatcher :: is_ignored :: excluded directory: %s", path)
             return True
 
@@ -59,13 +88,12 @@ class IgnoreMatcher:
             logger.debug("IgnoreMatcher :: is_ignored :: excluded extension: %s", path)
             return True
 
-        normalized = relative.as_posix()
-
-        from fnmatch import fnmatch
+        normalized = os.path.normcase(relative.as_posix())
+        name = os.path.normcase(relative.name)
 
         if any(
-            fnmatch(normalized, pattern) or fnmatch(relative.name, pattern)
-            for pattern in self.patterns
+            pattern.match(normalized) or pattern.match(name)
+            for pattern in self._compiled_patterns
         ):
             logger.debug("IgnoreMatcher :: is_ignored :: matched pattern: %s", path)
             return True

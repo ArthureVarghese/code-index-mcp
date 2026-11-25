@@ -91,6 +91,25 @@ class TestParseSections:
         lines = text.splitlines(keepends=True)
         assert sections[0].end_line == len(lines)
 
+    def test_text_is_split_once(self):
+        class CountingText(str):
+            split_calls = 0
+
+            def splitlines(self, *args, **kwargs):
+                self.split_calls += 1
+                return super().splitlines(*args, **kwargs)
+
+        text = CountingText("# One\ncontent\n## Two\nmore\n")
+        parse_sections(text)
+        assert text.split_calls == 1
+
+    def test_parent_source_excludes_child_sections(self):
+        text = "# Parent\nintro\n## Child\nchild body\n"
+        parent, child = parse_sections(text)
+        assert "intro" in parent.source
+        assert "child body" not in parent.source
+        assert "child body" in child.source
+
 
 class TestExtractLinks:
     def test_extract_links(self):

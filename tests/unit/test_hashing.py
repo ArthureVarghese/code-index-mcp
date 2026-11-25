@@ -1,9 +1,11 @@
+import ast
 from unittest.mock import patch
 
 from code_index_mcp.indexing.hashing import (
     _normalize_fallback,
     normalize_python_source,
     semantic_hash,
+    semantic_hash_ast,
     sha256_text,
 )
 
@@ -18,6 +20,17 @@ def test_semantic_hash_ignores_irrelevant_formatting():
     second = "def f():\n\n    return 1\n"
 
     assert semantic_hash(first) == semantic_hash(second)
+
+
+def test_semantic_hash_ast_ignores_formatting_and_nesting():
+    first = ast.parse("class C:\n    def f(self):\n        return 1\n")
+    second = ast.parse("class C:\n\n    def f(self):\n        return 1\n")
+
+    first_node = first.body[0].body[0]
+    second_node = second.body[0].body[0]
+
+    assert semantic_hash_ast(first, "") == semantic_hash_ast(second, "")
+    assert semantic_hash_ast(first_node, "") == semantic_hash_ast(second_node, "")
 
 
 class TestNormalizePythonSource:

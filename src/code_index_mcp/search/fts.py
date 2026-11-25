@@ -24,15 +24,17 @@ class FTSSearch:
         kind: str = "all",
         limit: int = 20,
         path: str | None = None,
+        tokens: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        tokens = _TOKEN_RE.findall(query)
+        explicit = tokens is not None
+        if tokens is None:
+            tokens = tokenize(query)
+            query = " ".join(tokens)
 
         if not tokens:
             return []
 
-        return self.repositories.search_text(
-            " ".join(tokens),
-            kind=kind,
-            limit=limit,
-            path=path,
-        )
+        kwargs: dict[str, Any] = {"kind": kind, "limit": limit, "path": path}
+        if explicit:
+            kwargs["tokens"] = tokens
+        return self.repositories.search_text(query, **kwargs)

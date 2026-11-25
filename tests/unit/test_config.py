@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from code_index_mcp.config import (
     IndexConfig,
     _env_bool,
 )
+from code_index_mcp.utils.logging import ColorFormatter
 
 
 class TestIndexConfigDefaults:
@@ -20,6 +23,7 @@ class TestIndexConfigDefaults:
         assert cfg.enable_watcher is False
         assert cfg.search_limit_default == 10
         assert cfg.search_limit_max == 100
+        assert cfg.dev_mode is False
 
     def test_custom_values(self):
         cfg = IndexConfig(
@@ -169,3 +173,26 @@ class TestEnvBool:
         monkeypatch.setenv("TEST_BOOL", "invalid")
         with pytest.raises(ValueError, match="Invalid boolean"):
             _env_bool("TEST_BOOL", False)
+
+
+class TestLoggingDefaults:
+    def test_environment_defaults_to_info(self, monkeypatch):
+        monkeypatch.delenv("CODE_INDEX_MCP_DEV", raising=False)
+        assert IndexConfig.from_environment().dev_mode is False
+
+    def test_color_formatter_does_not_mutate_levelname(self):
+        record = logging.LogRecord(
+            "test",
+            logging.INFO,
+            __file__,
+            1,
+            "message",
+            (),
+            None,
+        )
+        formatter = ColorFormatter("%(levelname)s %(message)s")
+
+        formatted = formatter.format(record)
+
+        assert "\033[" in formatted
+        assert record.levelname == "INFO"

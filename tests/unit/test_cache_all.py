@@ -204,3 +204,17 @@ class TestCacheManager:
             implementation_version="2.0",
         )
         assert result is None
+
+    def test_disabled_manager_skips_writes(self, database):
+        cache_manager = CacheManager(database.connection, enabled=False)
+        cache_manager.put(
+            project_id="proj1",
+            cache_key="key1",
+            layer="test",
+            source_hash="hash1",
+            dependency_hash=None,
+            implementation_version="1.0",
+            value="data",
+        )
+        count = database.execute("SELECT count(*) FROM cache_metadata").fetchone()[0]
+        assert count == 0

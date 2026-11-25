@@ -8,7 +8,7 @@ from pathlib import Path
 from ...indexing.hashing import (
     entity_content_hash,
     exact_source_hash,
-    semantic_hash_python,
+    semantic_hash_ast,
     structural_hash,
 )
 from ...indexing.versions import PYTHON_ANALYZER_VERSION
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 class PythonParseResult:
     entities: list[Entity]
     syntax_error: str | None
+    tree: ast.AST | None = None
 
     @property
     def errors(self) -> list[str]:
@@ -84,7 +85,7 @@ class PythonAnalyzer:
                 },
             ),
             exact_source_hash=exact_source_hash(source),
-            semantic_hash=semantic_hash_python(source),
+            semantic_hash=semantic_hash_ast(tree, source),
             structural_hash=structural_hash(
                 entity_type="module",
                 name=module_name,
@@ -120,6 +121,7 @@ class PythonAnalyzer:
         return PythonParseResult(
             entities=entities,
             syntax_error=None,
+            tree=tree,
         )
 
     def _walk_definitions(self, tree: ast.AST):
@@ -227,7 +229,7 @@ class PythonAnalyzer:
         )
 
         signature = _signature(node)
-        semantic = semantic_hash_python(source_text)
+        semantic = semantic_hash_ast(node, source_text)
 
         structural = structural_hash(
             entity_type=entity_type.value,
